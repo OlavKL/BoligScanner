@@ -951,9 +951,9 @@ st.sidebar.header("Slack-varsling")
 
 slack_alerts_on = st.sidebar.checkbox("Aktiver Slack-varsling", value=True)
 
-alert_name = st.sidebar.text_input("Navn på filter", value="Grimstad min 8% yield")
-min_yield_alert = st.sidebar.number_input("Varsel: minimum yield %", value=8.0, step=0.5)
-min_netto_alert = st.sidebar.number_input("Varsel: minimum netto etter lån", value=-100000, step=500)
+alert_name = st.sidebar.text_input("Navn på filter", value="Positiv kontantstrøm")
+min_yield_alert = st.sidebar.number_input("Varsel: minimum yield %", value=7.0, step=0.5)
+min_netto_alert = st.sidebar.number_input("Varsel: minimum netto etter lån", value=0, step=500)
 max_pris_alert = st.sidebar.number_input("Varsel: maks pris (0 = ingen maks)", value=0, step=100000)
 min_soverom_alert = st.sidebar.number_input("Varsel: minimum soverom", value=0, step=1)
 max_skole_km_alert = st.sidebar.number_input("Varsel: maks km til nærmeste skole (0 = ignorer)", value=0.0, step=0.5)
