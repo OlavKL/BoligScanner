@@ -2,12 +2,49 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
+from gmail_healthcheck import hent_gmail_status
+
 st.set_page_config(page_title="Dashboard", layout="wide")
 
 conn = sqlite3.connect("boliger.db", check_same_thread=False)
 c = conn.cursor()
 
 st.title("📊 Boligscanner Dashboard")
+
+# ---------------- GMAIL API-HELSE ----------------
+
+st.header("📧 Gmail API-helse")
+
+gmail_status = hent_gmail_status()
+
+if gmail_status is None:
+    st.info("Ingen helsesjekk kjørt enda. Kjøres automatisk hver dag kl. 12:00 (Europe/Oslo).")
+else:
+    g1, g2, g3 = st.columns(3)
+    g1.metric("Status", "OK ✅" if gmail_status["status"] == "ok" else "Feilet ❌")
+    g2.metric("Sist sjekket", gmail_status["checked_at"])
+    g3.metric("Sist vellykket", gmail_status["last_success_at"] or "aldri")
+
+    if gmail_status["status"] != "ok":
+        st.error(f"Feiltype: {gmail_status['error_type']} — {gmail_status['error_message']}")
+        if gmail_status["krever_reautentisering"]:
+            st.warning(
+                "⚠️ Gmail må autentiseres på nytt. Tokenet er ugyldig eller utløpt og kan "
+                "ikke fornyes automatisk. Slett token.json og kjør den lokale "
+                "innloggingsflyten på nytt for å generere et gyldig token."
+            )
+
+gmail_history = c.execute("""
+    SELECT checked_at, status, error_type
+    FROM gmail_health_log
+    ORDER BY id DESC LIMIT 10
+""").fetchall()
+
+if gmail_history:
+    df_gmail = pd.DataFrame(gmail_history, columns=["Tidspunkt", "Status", "Feiltype"])
+    st.dataframe(df_gmail, width="stretch", hide_index=True)
+
+st.divider()
 
 # ---------------- TOTALER ----------------
 

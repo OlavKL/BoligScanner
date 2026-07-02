@@ -1,13 +1,19 @@
+import atexit
 import re
 import base64
 import sqlite3
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from zoneinfo import ZoneInfo
+
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+
+from gmail_healthcheck import kjor_gmail_helsesjekk, hent_gmail_status
 
 
 st.set_page_config(page_title="Boligscanner", layout="wide")
@@ -16,6 +22,67 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 conn = sqlite3.connect("boliger.db", check_same_thread=False)
 c = conn.cursor()
+
+
+# ---------------- AUTOMATISK DAGLIG GMAIL-HELSESJEKK ----------------
+# Starter en bakgrunnsplanlegger som kjører kjor_gmail_helsesjekk() hver dag
+# kl. 12:00 (Europe/Oslo), uten at noen trenger å trykke på en knapp.
+# st.cache_resource sikrer at planleggeren kun startes én gang per prosess,
+# selv om Streamlit kjører hele skriptet på nytt ved hver interaksjon.
+# Dette fungerer også når appen kjører i Docker/på en server (Railway,
+# Render o.l.), så lenge prosessen holdes i live - helsesjekken krever
+# aldri en interaktiv nettleser-innlogging.
+@st.cache_resource
+def _start_gmail_health_scheduler():
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(
+        kjor_gmail_helsesjekk,
+        trigger="cron",
+        hour=12,
+        minute=0,
+        timezone=ZoneInfo("Europe/Oslo"),
+        id="gmail_daglig_helsesjekk",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.start()
+    atexit.register(lambda: scheduler.shutdown(wait=False))
+    return scheduler
+
+
+_start_gmail_health_scheduler()
+
+
+# ---------------- GMAIL-STATUS I SIDEBAR ----------------
+
+_gmail_status = hent_gmail_status()
+
+st.sidebar.header("Gmail API-status")
+
+if _gmail_status is None:
+    st.sidebar.info("Ingen helsesjekk kjørt enda. Kjøres automatisk hver dag kl. 12:00.")
+elif _gmail_status["status"] == "ok":
+    st.sidebar.success(f"Gmail API: OK\n\nSist bekreftet: {_gmail_status['checked_at']}")
+else:
+    st.sidebar.error(
+        f"Gmail API: Feilet\n\n"
+        f"Feiltype: {_gmail_status['error_type']}\n\n"
+        f"Sist vellykket: {_gmail_status['last_success_at'] or 'aldri'}"
+    )
+    if _gmail_status["krever_reautentisering"]:
+        st.sidebar.warning(
+            "⚠️ Gmail-tokenet er ugyldig eller utløpt. Gmail må autentiseres på "
+            "nytt: slett token.json og kjør den lokale innloggingsflyten "
+            "(f.eks. gmail_test.py) på nytt for å generere et nytt token.json."
+        )
+
+if st.sidebar.button("Kjør Gmail-helsesjekk nå"):
+    ok, feiltype, melding = kjor_gmail_helsesjekk()
+    if ok:
+        st.sidebar.success("Gmail API: OK")
+    else:
+        st.sidebar.error(f"Gmail API feilet: {feiltype} - {melding}")
+    st.rerun()
 
 
 # ---------------- DATABASE ----------------
