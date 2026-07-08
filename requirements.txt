@@ -7,3 +7,4 @@ google-auth
 google-auth-oauthlib
 APScheduler
 tzdata
+pypdf

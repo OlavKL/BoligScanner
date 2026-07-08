@@ -40,6 +40,7 @@ from broker_document_parser import (
     PRIMARY_DOCUMENT_TYPES,
     CONDITION_REPORT_DOCUMENT_TYPES,
 )
+from document_parser import analyze_salgsoppgave_pdf, COMPONENT_ORDER, COMPONENT_DISPLAY_NAVN
 
 # Statuser (for både salgsoppgave og tilstandsrapport) som betyr "et dokument
 # ble funnet, men ikke lastet ned som en direkte PDF" - fortsatt et FUNN, bare
@@ -171,6 +172,8 @@ for col, coltype in [
     ("tilstandsrapport_document_url", "TEXT"),
     ("salgsoppgave_download_status", "TEXT"),
     ("tilstandsrapport_download_status", "TEXT"),
+    ("document_analysis_json", "TEXT"),
+    ("document_analysis_source_path", "TEXT"),
 ]:
     try:
         c.execute(f"ALTER TABLE boliger ADD COLUMN {col} {coltype}")
@@ -897,7 +900,15 @@ def lagre_salgsoppgave_forsok(result):
     ))
     conn.commit()
 
-    oppdater_bolig_broker_og_salgsoppgave(result.finn_ad_id, result.finn_url, result)
+    bolig_id = oppdater_bolig_broker_og_salgsoppgave(result.finn_ad_id, result.finn_url, result)
+
+    # Analyser salgsoppgaven med en gang en ekte PDF er lastet ned - dette
+    # dekker automatisk alle flytene (enkelt-knapp, batch, backfill) siden de
+    # alle går via denne funksjonen.
+    if bolig_id and result.local_pdf_path:
+        analyser_og_lagre_dokumentanalyse(bolig_id, result.local_pdf_path)
+
+    return bolig_id
 
 
 def finn_bolig_id_for_finn_annonse(finn_ad_id, finn_url):
@@ -1015,6 +1026,37 @@ def oppdater_bolig_broker_og_salgsoppgave(finn_ad_id, finn_url, result):
     conn.commit()
 
     return bolig_id
+
+
+def analyser_og_lagre_dokumentanalyse(bolig_id, local_pdf_path, force=False):
+    """Kjører document_parser på salgsoppgave-PDF-en og lagrer resultatet som
+    document_analysis_json på bolig-raden.
+
+    Parser aldri samme fil to ganger: hvis document_analysis_source_path
+    allerede peker på nøyaktig denne filstien, hoppes analysen over med
+    mindre force=True er satt eksplisitt (f.eks. fra en "Analyser på nytt"-knapp).
+    """
+    if not local_pdf_path or not os.path.exists(local_pdf_path):
+        return False
+
+    if not force:
+        row = c.execute(
+            "SELECT document_analysis_source_path FROM boliger WHERE id = ?", (bolig_id,)
+        ).fetchone()
+        if row and row[0] == local_pdf_path:
+            return False
+
+    analyse = analyze_salgsoppgave_pdf(local_pdf_path)
+    analyse_json = json.dumps(analyse, ensure_ascii=False) if analyse else None
+
+    c.execute("""
+    UPDATE boliger
+    SET document_analysis_json = ?, document_analysis_source_path = ?
+    WHERE id = ?
+    """, (analyse_json, local_pdf_path, bolig_id))
+    conn.commit()
+
+    return True
 
 
 def _hent_meglerside_trygt(url):
@@ -2457,7 +2499,7 @@ with u2:
 rows = c.execute("""
 SELECT id, url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre, image_url, eieform, solgt, lat, lon, nearest_school, nearest_school_km, nearest_school_min,
        broker_name, broker_source_domain, salgsoppgave_status, salgsoppgave_local_path, broker_listing_url, tilstandsrapport_local_path,
-       salgsoppgave_document_url, tilstandsrapport_document_url
+       salgsoppgave_document_url, tilstandsrapport_document_url, document_analysis_json
 FROM boliger
 ORDER BY id DESC
 """).fetchall()
@@ -2500,7 +2542,7 @@ if st.button("Slett alle boliger"):
 boliger = []
 
 for row in rows:
-    bolig_id, saved_url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre, image_url, eieform, solgt, lat, lon, nearest_school, nearest_school_km, nearest_school_min, broker_name, broker_source_domain, salgsoppgave_status, salgsoppgave_local_path, broker_listing_url, tilstandsrapport_local_path, salgsoppgave_document_url, tilstandsrapport_document_url = row
+    bolig_id, saved_url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre, image_url, eieform, solgt, lat, lon, nearest_school, nearest_school_km, nearest_school_min, broker_name, broker_source_domain, salgsoppgave_status, salgsoppgave_local_path, broker_listing_url, tilstandsrapport_local_path, salgsoppgave_document_url, tilstandsrapport_document_url, document_analysis_json = row
 
     pris = pris or 0
     felleskost = felleskost or 0
@@ -2569,6 +2611,7 @@ for row in rows:
         "tilstandsrapport_local_path": tilstandsrapport_local_path,
         "salgsoppgave_document_url": salgsoppgave_document_url,
         "tilstandsrapport_document_url": tilstandsrapport_document_url,
+        "document_analysis_json": document_analysis_json,
         "netto_etter_lan": netto_etter_lan,
         "yield_pct": yield_pct,
         "hopp": hopp,
@@ -2760,6 +2803,48 @@ for b in boliger[start_idx:end_idx]:
                 st.link_button("Åpne digital tilstandsrapport", tilstandsrapport_url, key=f"open_card_tilstandsrapport_{b['id']}")
             else:
                 st.write("Ikke funnet")
+
+            with st.expander("Dokumentopplysninger"):
+                analyse = {}
+                if b.get("document_analysis_json"):
+                    try:
+                        analyse = json.loads(b["document_analysis_json"])
+                    except (TypeError, ValueError):
+                        analyse = {}
+
+                if not analyse:
+                    st.write("Ingen dokumentanalyse tilgjengelig ennå.")
+                else:
+                    for komponent in COMPONENT_ORDER:
+                        komponent_data = analyse.get(komponent)
+                        if not komponent_data:
+                            continue
+
+                        st.markdown(f"**{COMPONENT_DISPLAY_NAVN.get(komponent, komponent)}**")
+
+                        if komponent_data.get("tg"):
+                            st.write(komponent_data["tg"])
+                        if komponent_data.get("remark"):
+                            st.write(komponent_data["remark"])
+
+                        detaljer = []
+                        if komponent_data.get("year"):
+                            detaljer.append(f"Nevnt år: {komponent_data['year']}")
+                        if komponent_data.get("cost"):
+                            detaljer.append(f"Nevnt kostnad: {komponent_data['cost']}")
+                        if detaljer:
+                            st.caption(" · ".join(detaljer))
+
+                    nokkelord = analyse.get("keywords")
+                    if nokkelord:
+                        st.markdown("**Nøkkelord**")
+                        for kw in nokkelord:
+                            st.write(f"• {kw.capitalize()}")
+
+                if b.get("salgsoppgave_local_path") and os.path.exists(b["salgsoppgave_local_path"]):
+                    if st.button("Analyser dokumenter på nytt", key=f"reanalyze_{b['id']}"):
+                        analyser_og_lagre_dokumentanalyse(b["id"], b["salgsoppgave_local_path"], force=True)
+                        st.rerun()
 
             with st.expander("Åpne / rediger bolig"):
                 st.info("Redigering av boligdata beholdes som før. Avstand beregnes automatisk når ny bolig lagres.")
