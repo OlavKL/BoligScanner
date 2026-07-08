@@ -42,3 +42,6 @@ Thumbs.db
 
 # --- Jupyter ---
 .ipynb_checkpoints/
+
+# --- Downloaded documents (local cache) ---
+data/

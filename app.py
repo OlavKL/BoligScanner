@@ -1,8 +1,12 @@
 import atexit
+import json
+import os
 import re
 import base64
 import sqlite3
+import time
 import requests
+import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
@@ -14,6 +18,33 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 from gmail_healthcheck import kjor_gmail_helsesjekk, hent_gmail_status
+from salgsoppgave_downloader import (
+    hent_salgsoppgave,
+    extract_finn_ad_id,
+    extract_broker_info,
+    is_downloaded_status,
+    DOWNLOADED_STATUSES,
+    RESOLVED_STATUSES,
+    STATUS_LINK_FOUND_NOT_PDF,
+    STATUS_INVALID_PDF_RESPONSE,
+    STATUS_LISTING_SOLD_OR_INACTIVE,
+    STATUS_DOWNLOADED_VALID_PDF,
+    get_default_headers,
+    REQUEST_TIMEOUT,
+)
+from broker_site_fallback import find_and_download_from_broker_site
+from broker_document_parser import (
+    download_broker_documents,
+    velg_primaert_dokument,
+    er_megler_side_solgt_eller_inaktiv,
+    PRIMARY_DOCUMENT_TYPES,
+    CONDITION_REPORT_DOCUMENT_TYPES,
+)
+
+# Statuser (for både salgsoppgave og tilstandsrapport) som betyr "et dokument
+# ble funnet, men ikke lastet ned som en direkte PDF" - fortsatt et FUNN, bare
+# noe brukeren må åpne selv (typisk en digital salgsoppgave hos Aktiv o.l.).
+DOCUMENT_URL_ONLY_STATUSES = (STATUS_LINK_FOUND_NOT_PDF, STATUS_INVALID_PDF_RESPONSE)
 
 
 st.set_page_config(page_title="Boligscanner", layout="wide")
@@ -125,6 +156,21 @@ for col, coltype in [
     ("nearest_school", "TEXT"),
     ("nearest_school_km", "REAL"),
     ("nearest_school_min", "REAL"),
+    ("broker_name", "TEXT"),
+    ("broker_office", "TEXT"),
+    ("broker_profile_url", "TEXT"),
+    ("broker_source_domain", "TEXT"),
+    ("salgsoppgave_status", "TEXT"),
+    ("salgsoppgave_local_path", "TEXT"),
+    ("broker_listing_url", "TEXT"),
+    ("salgsoppgave_source", "TEXT"),
+    ("salgsoppgave_source_detail", "TEXT"),
+    ("tilstandsrapport_local_path", "TEXT"),
+    ("downloaded_documents_json", "TEXT"),
+    ("salgsoppgave_document_url", "TEXT"),
+    ("tilstandsrapport_document_url", "TEXT"),
+    ("salgsoppgave_download_status", "TEXT"),
+    ("tilstandsrapport_download_status", "TEXT"),
 ]:
     try:
         c.execute(f"ALTER TABLE boliger ADD COLUMN {col} {coltype}")
@@ -151,6 +197,41 @@ CREATE TABLE IF NOT EXISTS leiepriser (
 )
 """)
 conn.commit()
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS salgsoppgave_forsok (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finn_url TEXT,
+    finn_ad_id TEXT,
+    found_document_url TEXT,
+    local_pdf_path TEXT,
+    status TEXT,
+    attempted_at TEXT,
+    error_message TEXT
+)
+""")
+conn.commit()
+
+for col, coltype in [
+    ("broker_name", "TEXT"),
+    ("broker_office", "TEXT"),
+    ("broker_profile_url", "TEXT"),
+    ("broker_source_domain", "TEXT"),
+    ("broker_listing_url", "TEXT"),
+    ("salgsoppgave_source", "TEXT"),
+    ("salgsoppgave_source_detail", "TEXT"),
+    ("tilstandsrapport_local_path", "TEXT"),
+    ("downloaded_documents_json", "TEXT"),
+    ("salgsoppgave_document_url", "TEXT"),
+    ("tilstandsrapport_document_url", "TEXT"),
+    ("salgsoppgave_download_status", "TEXT"),
+    ("tilstandsrapport_download_status", "TEXT"),
+]:
+    try:
+        c.execute(f"ALTER TABLE salgsoppgave_forsok ADD COLUMN {col} {coltype}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 # ---------------- HELPERS ----------------
 
 def clean_number(text):
@@ -659,8 +740,18 @@ def scrape_finn(url):
         r"(\d+)\s*soverom",
     ], text))
 
-   
+
     eieform = "Selveier"
+
+    try:
+        broker_info = extract_broker_info(r.text, url)
+    except Exception:
+        broker_info = {
+            "broker_name": None,
+            "broker_office": None,
+            "broker_profile_url": None,
+            "broker_source_domain": None,
+        }
 
     return {
         "url": url,
@@ -677,6 +768,10 @@ def scrape_finn(url):
         "image_url": image_url,
         "eieform": eieform,
         "solgt": solgt,
+        "broker_name": broker_info["broker_name"],
+        "broker_office": broker_info["broker_office"],
+        "broker_profile_url": broker_info["broker_profile_url"],
+        "broker_source_domain": broker_info["broker_source_domain"],
     }
 
 
@@ -764,6 +859,534 @@ def log_event(event_type, bolig_id=None, bolig_url="", filter_name=""):
     conn.commit()
 
 
+def lagre_salgsoppgave_forsok(result):
+    downloaded_documents_json = json.dumps(result.downloaded_documents, ensure_ascii=False)
+
+    c.execute("""
+    INSERT INTO salgsoppgave_forsok (
+        finn_url, finn_ad_id, found_document_url, local_pdf_path,
+        status, attempted_at, error_message,
+        broker_name, broker_office, broker_profile_url, broker_source_domain,
+        broker_listing_url, salgsoppgave_source, salgsoppgave_source_detail,
+        tilstandsrapport_local_path, downloaded_documents_json,
+        salgsoppgave_document_url, tilstandsrapport_document_url,
+        salgsoppgave_download_status, tilstandsrapport_download_status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        result.finn_url,
+        result.finn_ad_id,
+        result.found_document_url,
+        result.local_pdf_path,
+        result.status,
+        result.attempted_at,
+        result.error_message,
+        result.broker_name,
+        result.broker_office,
+        result.broker_profile_url,
+        result.broker_source_domain,
+        result.broker_listing_url,
+        result.salgsoppgave_source,
+        result.salgsoppgave_source_detail,
+        result.tilstandsrapport_local_path,
+        downloaded_documents_json,
+        result.found_document_url,
+        result.tilstandsrapport_document_url,
+        result.status,
+        result.tilstandsrapport_status,
+    ))
+    conn.commit()
+
+    oppdater_bolig_broker_og_salgsoppgave(result.finn_ad_id, result.finn_url, result)
+
+
+def finn_bolig_id_for_finn_annonse(finn_ad_id, finn_url):
+    """Finner id i boliger-tabellen for en FINN-annonse.
+
+    Prøver finn_ad_id først (robust mot at url-varianter/spørrestrenger endrer seg),
+    faller tilbake til eksakt url-match. Brukes for å oppdatere riktig eksisterende
+    rad uten å risikere å opprette duplikater.
+    """
+    if finn_ad_id:
+        alle = c.execute("""
+        SELECT id, url FROM boliger WHERE url IS NOT NULL AND url != ''
+        """).fetchall()
+
+        for rid, rurl in alle:
+            if extract_finn_ad_id(rurl) == finn_ad_id:
+                return rid
+
+    if finn_url:
+        row = c.execute("SELECT id FROM boliger WHERE url = ?", (finn_url,)).fetchone()
+        if row:
+            return row[0]
+
+    return None
+
+
+def oppdater_bolig_broker_og_salgsoppgave(finn_ad_id, finn_url, result):
+    """Oppdaterer megler- og salgsoppgave-felter på den matchende bolig-raden.
+
+    Regraderer aldri: hvis raden allerede har en ekte nedlastet PDF for
+    salgsoppgave og/eller tilstandsrapport fra et tidligere forsøk, og DETTE
+    forsøket bare fant en digital lenke (eller ingenting), beholdes det
+    forrige, bedre resultatet for akkurat det dokumentet uendret. De to
+    dokumenttypene vurderes helt uavhengig av hverandre.
+
+    Returnerer bolig_id hvis en rad ble funnet og oppdatert, ellers None.
+    """
+    bolig_id = finn_bolig_id_for_finn_annonse(finn_ad_id, finn_url)
+
+    if not bolig_id:
+        return None
+
+    eksisterende = c.execute("""
+    SELECT salgsoppgave_status, salgsoppgave_local_path, salgsoppgave_document_url,
+           tilstandsrapport_download_status, tilstandsrapport_local_path, tilstandsrapport_document_url
+    FROM boliger WHERE id = ?
+    """, (bolig_id,)).fetchone()
+
+    (
+        eksisterende_salgsoppgave_status, eksisterende_salgsoppgave_path, eksisterende_salgsoppgave_url,
+        eksisterende_tilstand_status, eksisterende_tilstand_path, eksisterende_tilstand_url,
+    ) = eksisterende if eksisterende else (None, None, None, None, None, None)
+
+    ny_salgsoppgave_status = result.status
+    ny_salgsoppgave_path = result.local_pdf_path
+    ny_salgsoppgave_url = result.found_document_url
+
+    if eksisterende_salgsoppgave_status in DOWNLOADED_STATUSES and ny_salgsoppgave_status not in DOWNLOADED_STATUSES:
+        ny_salgsoppgave_status = eksisterende_salgsoppgave_status
+        ny_salgsoppgave_path = eksisterende_salgsoppgave_path
+        ny_salgsoppgave_url = eksisterende_salgsoppgave_url
+
+    ny_tilstand_status = result.tilstandsrapport_status
+    ny_tilstand_path = result.tilstandsrapport_local_path
+    ny_tilstand_url = result.tilstandsrapport_document_url
+
+    if eksisterende_tilstand_status == STATUS_DOWNLOADED_VALID_PDF and ny_tilstand_status != STATUS_DOWNLOADED_VALID_PDF:
+        ny_tilstand_status = eksisterende_tilstand_status
+        ny_tilstand_path = eksisterende_tilstand_path
+        ny_tilstand_url = eksisterende_tilstand_url
+
+    # Ikke overskriv med en tom liste hvis dette forsøket ikke fant noen nye
+    # dokumenter - da beholdes det som ble lastet ned i et tidligere forsøk.
+    downloaded_documents_json = (
+        json.dumps(result.downloaded_documents, ensure_ascii=False)
+        if result.downloaded_documents else None
+    )
+
+    c.execute("""
+    UPDATE boliger
+    SET broker_name = COALESCE(?, broker_name),
+        broker_office = COALESCE(?, broker_office),
+        broker_profile_url = COALESCE(?, broker_profile_url),
+        broker_source_domain = COALESCE(?, broker_source_domain),
+        broker_listing_url = COALESCE(?, broker_listing_url),
+        salgsoppgave_status = ?,
+        salgsoppgave_local_path = ?,
+        salgsoppgave_document_url = ?,
+        salgsoppgave_download_status = ?,
+        salgsoppgave_source = ?,
+        salgsoppgave_source_detail = ?,
+        tilstandsrapport_local_path = ?,
+        tilstandsrapport_document_url = ?,
+        tilstandsrapport_download_status = ?,
+        downloaded_documents_json = COALESCE(?, downloaded_documents_json)
+    WHERE id = ?
+    """, (
+        result.broker_name,
+        result.broker_office,
+        result.broker_profile_url,
+        result.broker_source_domain,
+        result.broker_listing_url,
+        ny_salgsoppgave_status,
+        ny_salgsoppgave_path,
+        ny_salgsoppgave_url,
+        ny_salgsoppgave_status,
+        result.salgsoppgave_source,
+        result.salgsoppgave_source_detail,
+        ny_tilstand_path,
+        ny_tilstand_url,
+        ny_tilstand_status,
+        downloaded_documents_json,
+        bolig_id,
+    ))
+    conn.commit()
+
+    return bolig_id
+
+
+def _hent_meglerside_trygt(url):
+    """Henter en meglerside med samme høflige innstillinger som resten av
+    modulen. Returnerer None (aldri unntak) ved nettverksfeil/4xx/5xx."""
+    try:
+        resp = requests.get(url, headers=get_default_headers(), timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException:
+        return None
+
+    if resp.status_code >= 400:
+        return None
+
+    return resp
+
+
+def _anvend_broker_dokumenter(result, documents, kilde_beskrivelse):
+    """Fyller inn salgsoppgave-/tilstandsrapport-feltene på result basert på
+    dokumentene funnet på en godtatt meglerside.
+
+    Både salgsoppgave og tilstandsrapport behandles uavhengig av hverandre -
+    en digital/fil-proxy-lenke telles som "funnet" selv uten nedlastet PDF
+    (result.status/tilstandsrapport_status = document_link_found_but_not_direct_pdf),
+    og document_url lagres uansett slik at brukeren kan åpne den manuelt.
+    """
+    salgsoppgave_doc = velg_primaert_dokument(documents, PRIMARY_DOCUMENT_TYPES)
+    tilstand_doc = velg_primaert_dokument(documents, CONDITION_REPORT_DOCUMENT_TYPES)
+
+    result.downloaded_documents = [doc.as_dict() for doc in documents if doc.local_path]
+
+    if tilstand_doc:
+        result.tilstandsrapport_status = tilstand_doc.download_status
+        if tilstand_doc.download_status == STATUS_DOWNLOADED_VALID_PDF:
+            result.tilstandsrapport_local_path = tilstand_doc.local_path
+        else:
+            result.tilstandsrapport_document_url = tilstand_doc.url
+    else:
+        result.tilstandsrapport_status = "document_not_found"
+
+    if salgsoppgave_doc:
+        result.salgsoppgave_source = "broker_site"
+        result.found_document_url = salgsoppgave_doc.url
+
+        if salgsoppgave_doc.download_status == STATUS_DOWNLOADED_VALID_PDF:
+            result.status = "found_from_broker_site"
+            result.local_pdf_path = salgsoppgave_doc.local_path
+            result.salgsoppgave_source_detail = f"Salgsoppgave lastet ned {kilde_beskrivelse}."
+        elif salgsoppgave_doc.download_status == STATUS_LINK_FOUND_NOT_PDF:
+            result.status = STATUS_LINK_FOUND_NOT_PDF
+            result.salgsoppgave_source_detail = (
+                f"Salgsoppgave funnet {kilde_beskrivelse}, men må åpnes som digital salgsoppgave "
+                "(ikke en direkte PDF-fil)."
+            )
+        else:
+            result.status = STATUS_INVALID_PDF_RESPONSE
+            result.salgsoppgave_source_detail = (
+                f"Fant en dokumentlenke {kilde_beskrivelse}, men innholdet så ikke ut som en gyldig PDF."
+            )
+    else:
+        result.status = "not_found"
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            f"Ingen salgsoppgave/prospekt funnet {kilde_beskrivelse}."
+            + (" Fant derimot en tilstandsrapport/takst." if tilstand_doc else "")
+        )
+
+
+def hent_salgsoppgave_med_broker_fallback(finn_url, adresse="", postnummer="", by=""):
+    """Prøver FINN-annonsen først (hent_salgsoppgave). Hvis salgsoppgave ikke ble
+    funnet der og annonsen fortsatt er aktiv, følges denne foretrukne rekkefølgen:
+
+    1. FINN-PDF direkte (hent_salgsoppgave).
+    2. Hvis FINN-annonsen har en direkte lenke til meglerens boligside (typisk
+       knappen "Se komplett salgsoppgave"), følges DEN lenken. Den garanterer at
+       vi havner på riktig eiendom, så broker_listing_url lagres med en gang -
+       selv om dokumentsøket på meglersiden ikke gir noen nedlastbar fil.
+    3. KUN hvis FINN-annonsen ikke har en slik direktelenke, brukes den eldre
+       adressesøk-fallbacken (broker_site_fallback) som prøver å gjette seg
+       frem til riktig bolig hos megleren.
+
+    Et funnet dokument som viser seg å være en digital salgsoppgave/fil-proxy
+    (typisk Aktiv) telles som FUNNET (status=document_link_found_but_not_direct_pdf),
+    ikke som en feil - se broker_document_parser.py.
+
+    Returnerer (result, debug_info). debug_info er en dict med detaljer om
+    FINN-forsøket og megler-søket - brukes av "Test broker fallback"-seksjonen
+    for feilsøking/tuning, men er fritt å ignorere for andre kallere.
+    """
+    result = hent_salgsoppgave(finn_url)
+
+    debug_info = {
+        "finn_status": result.status,
+        "finn_listing_active": result.finn_listing_active,
+        "finn_source_detail": result.salgsoppgave_source_detail,
+        "broker_property_link": result.broker_property_link,
+        "broker_link_strategy": None,  # "direct_link" | "address_search" | None
+        "broker_attempted": False,
+        "broker_search_urls_attempted": [],
+        "broker_candidate_urls": [],
+        "broker_candidate_evaluations": [],
+        "broker_doc_links_found": [],
+        "broker_skip_reason": None,
+    }
+
+    if is_downloaded_status(result.status):
+        return result, debug_info
+
+    if result.status == "error":
+        return result, debug_info
+
+    # result.status == "not_found" herfra - vurder megler-fallback.
+    if not result.finn_listing_active:
+        debug_info["broker_skip_reason"] = "Annonsen er ikke aktiv (solgt/avsluttet)."
+        result.status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.tilstandsrapport_status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            (result.salgsoppgave_source_detail + " " if result.salgsoppgave_source_detail else "")
+            + "Annonsen er ikke aktiv (solgt/avsluttet) - hopper over megler-søk."
+        ).strip()
+        return result, debug_info
+
+    # --- Steg 2: direkte lenke via "Se komplett salgsoppgave" (foretrukket) ---
+    if result.broker_property_link:
+        debug_info["broker_attempted"] = True
+        debug_info["broker_link_strategy"] = "direct_link"
+
+        # Lagres med en gang - selv om siden under skulle vise seg å ikke gi
+        # noen nedlastbare dokumenter.
+        result.broker_listing_url = result.broker_property_link
+
+        broker_page = _hent_meglerside_trygt(result.broker_property_link)
+
+        if broker_page is None:
+            result.salgsoppgave_source = "not_found"
+            result.salgsoppgave_source_detail = (
+                f"Fant direktelenke til megler ({result.broker_property_link}), "
+                "men klarte ikke å hente meglersiden."
+            )
+            return result, debug_info
+
+        if er_megler_side_solgt_eller_inaktiv(broker_page.text):
+            result.status = STATUS_LISTING_SOLD_OR_INACTIVE
+            result.tilstandsrapport_status = STATUS_LISTING_SOLD_OR_INACTIVE
+            result.salgsoppgave_source = "not_found"
+            result.salgsoppgave_source_detail = (
+                f"Meglersiden ({result.broker_property_link}) indikerer at boligen er solgt/ikke lenger aktiv."
+            )
+            return result, debug_info
+
+        documents = download_broker_documents(
+            broker_page.text, result.broker_property_link, finn_ad_id=result.finn_ad_id
+        )
+        debug_info["broker_doc_links_found"] = [
+            {"type": doc.doc_type, "url": doc.url, "text": doc.text, "download_status": doc.download_status}
+            for doc in documents
+        ]
+
+        _anvend_broker_dokumenter(
+            result, documents, f"via direktelenke fra FINN ('Se komplett salgsoppgave') til {result.broker_property_link}"
+        )
+
+        # Viktig: siden direktelenken fantes, skal IKKE adressesøk-fallbacken
+        # forsøkes i tillegg (se punkt 7 i kravspesifikasjonen).
+        return result, debug_info
+
+    # --- Steg 3: adressesøk-fallback (kun når direktelenken mangler) ---
+    debug_info["broker_link_strategy"] = "address_search"
+
+    if not result.broker_source_domain:
+        debug_info["broker_skip_reason"] = "Ingen kjent meglerdomene oppdaget på FINN-annonsen."
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            (result.salgsoppgave_source_detail + " " if result.salgsoppgave_source_detail else "")
+            + "Ingen kjent meglerdomene oppdaget - hopper over megler-søk."
+        ).strip()
+        return result, debug_info
+
+    if not adresse:
+        debug_info["broker_skip_reason"] = "Mangler adresse for boligen."
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            (result.salgsoppgave_source_detail + " " if result.salgsoppgave_source_detail else "")
+            + "Mangler adresse for boligen - kan ikke søke hos megler."
+        ).strip()
+        return result, debug_info
+
+    debug_info["broker_attempted"] = True
+
+    try:
+        broker_result = find_and_download_from_broker_site(
+            broker_domain=result.broker_source_domain,
+            adresse=adresse,
+            postnummer=postnummer,
+            by=by,
+            finn_ad_id=result.finn_ad_id,
+        )
+    except Exception as e:
+        debug_info["broker_skip_reason"] = f"Megler-søk feilet uventet: {e}"
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = f"Megler-søk feilet uventet: {e}"
+        return result, debug_info
+
+    debug_info["broker_search_urls_attempted"] = broker_result.search_urls_attempted
+    debug_info["broker_candidate_urls"] = broker_result.candidate_urls
+    debug_info["broker_candidate_evaluations"] = broker_result.candidate_evaluations
+    debug_info["broker_doc_links_found"] = broker_result.doc_links_found
+
+    if broker_result.listing_url:
+        result.broker_listing_url = broker_result.listing_url
+
+    if broker_result.listing_sold_or_inactive:
+        result.status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.tilstandsrapport_status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = broker_result.match_detail
+        return result, debug_info
+
+    _anvend_broker_dokumenter(result, broker_result.documents, "hos megler (adressesøk)")
+
+    return result, debug_info
+
+
+# Kolonnerekkefølgen brukt i alle batch-/backfill-resultattabeller.
+RESULTAT_TABELL_KOLONNER = [
+    "adresse", "finn_ad_id", "broker_source_domain", "broker_listing_url",
+    "salgsoppgave_status", "salgsoppgave_document_url", "salgsoppgave_local_path",
+    "tilstandsrapport_status", "tilstandsrapport_document_url", "tilstandsrapport_local_path",
+    "error_message",
+]
+
+
+def resultat_rad_fra_result(adresse_visning, result):
+    return {
+        "adresse": adresse_visning,
+        "finn_url": result.finn_url,
+        "finn_ad_id": result.finn_ad_id,
+        "broker_name": result.broker_name,
+        "broker_source_domain": result.broker_source_domain,
+        "broker_listing_url": result.broker_listing_url,
+        "salgsoppgave_status": result.status,
+        "salgsoppgave_document_url": result.found_document_url,
+        "salgsoppgave_local_path": result.local_pdf_path,
+        "tilstandsrapport_status": result.tilstandsrapport_status,
+        "tilstandsrapport_document_url": result.tilstandsrapport_document_url,
+        "tilstandsrapport_local_path": result.tilstandsrapport_local_path,
+        "error_message": result.error_message,
+    }
+
+
+def resultat_rad_uventet_feil(adresse_visning, bolig_url, error_message):
+    return {
+        "adresse": adresse_visning,
+        "finn_url": bolig_url,
+        "finn_ad_id": None,
+        "broker_name": None,
+        "broker_source_domain": None,
+        "broker_listing_url": None,
+        "salgsoppgave_status": "error",
+        "salgsoppgave_document_url": None,
+        "salgsoppgave_local_path": None,
+        "tilstandsrapport_status": None,
+        "tilstandsrapport_document_url": None,
+        "tilstandsrapport_local_path": None,
+        "error_message": error_message,
+    }
+
+
+def status_bucket(status):
+    """Grupperer en salgsoppgave-status for oppsummerings-tellere i batch-kjøringer."""
+    if is_downloaded_status(status):
+        return "downloaded"
+    if status in DOCUMENT_URL_ONLY_STATUSES:
+        return "digital"
+    if status in ("not_found", STATUS_LISTING_SOLD_OR_INACTIVE):
+        return "not_found"
+    return "error"
+
+
+def hent_nylige_boliger_med_url(limit=20):
+    return c.execute("""
+    SELECT id, url, adresse, postnummer, by
+    FROM boliger
+    WHERE url IS NOT NULL AND url != ''
+    ORDER BY id DESC
+    LIMIT ?
+    """, (limit,)).fetchall()
+
+
+def hent_boliger_med_manglende_data(limit=20):
+    return c.execute("""
+    SELECT id, url, adresse, postnummer, by
+    FROM boliger
+    WHERE url IS NOT NULL AND url != ''
+    AND (
+        broker_name IS NULL OR broker_name = ''
+        OR broker_source_domain IS NULL OR broker_source_domain = ''
+        OR salgsoppgave_status IS NULL OR salgsoppgave_status = ''
+        OR salgsoppgave_local_path IS NULL OR salgsoppgave_local_path = ''
+    )
+    ORDER BY id DESC
+    LIMIT ?
+    """, (limit,)).fetchall()
+
+
+DOWNLOADED_STATUSES_SQL = "(" + ", ".join(f"'{s}'" for s in DOWNLOADED_STATUSES) + ")"
+RESOLVED_STATUSES_SQL = "(" + ", ".join(f"'{s}'" for s in RESOLVED_STATUSES) + ")"
+
+
+def hent_alle_boliger_for_full_backfill(force_recheck=False):
+    if force_recheck:
+        return c.execute("""
+        SELECT id, url, adresse, postnummer, by
+        FROM boliger
+        WHERE url IS NOT NULL AND url != ''
+        ORDER BY id ASC
+        """).fetchall()
+
+    # Solgt/inaktiv hopper alltid over (uansett broker_name - en solgt megler-
+    # side gir aldri mer informasjon ved et nytt forsøk). De andre "ferdige"
+    # statusene (inkl. digital salgsoppgave) krever i tillegg at vi har
+    # megler-info, slik at en rad uten kjent megler fortsatt forsøkes på nytt.
+    return c.execute(f"""
+    SELECT id, url, adresse, postnummer, by
+    FROM boliger
+    WHERE url IS NOT NULL AND url != ''
+    AND NOT (
+        salgsoppgave_status = '{STATUS_LISTING_SOLD_OR_INACTIVE}'
+        OR (
+            broker_name IS NOT NULL AND broker_name != ''
+            AND salgsoppgave_status IN {RESOLVED_STATUSES_SQL}
+        )
+    )
+    ORDER BY id ASC
+    """).fetchall()
+
+
+SALGSOPPGAVE_FORSOK_KOLONNER = [
+    "finn_url", "finn_ad_id", "found_document_url", "local_pdf_path",
+    "status", "attempted_at", "error_message",
+    "broker_name", "broker_office", "broker_profile_url", "broker_source_domain",
+    "broker_listing_url", "salgsoppgave_source", "salgsoppgave_source_detail",
+    "tilstandsrapport_local_path", "tilstandsrapport_document_url", "tilstandsrapport_download_status",
+]
+
+
+def hent_siste_vellykkede_salgsoppgave(finn_ad_id, finn_url):
+    kolonner = ", ".join(SALGSOPPGAVE_FORSOK_KOLONNER)
+    row = None
+
+    if finn_ad_id:
+        row = c.execute(f"""
+        SELECT {kolonner}
+        FROM salgsoppgave_forsok
+        WHERE finn_ad_id = ? AND status IN {DOWNLOADED_STATUSES_SQL}
+        ORDER BY id DESC LIMIT 1
+        """, (finn_ad_id,)).fetchone()
+
+    if not row and finn_url:
+        row = c.execute(f"""
+        SELECT {kolonner}
+        FROM salgsoppgave_forsok
+        WHERE finn_url = ? AND status IN {DOWNLOADED_STATUSES_SQL}
+        ORDER BY id DESC LIMIT 1
+        """, (finn_url,)).fetchone()
+
+    if not row:
+        return None
+
+    return dict(zip(SALGSOPPGAVE_FORSOK_KOLONNER, row))
+
+
 def lagre_bolig(data):
     if url_exists(data["url"]):
         return False, None
@@ -778,9 +1401,10 @@ def lagre_bolig(data):
     INSERT INTO boliger (
         url, adresse, postnummer, by, pris, felleskost,
         soverom, leie, strom, kommunale, andre, image_url, eieform, solgt,
-        alerted_rules, lat, lon, nearest_school, nearest_school_km, nearest_school_min
+        alerted_rules, lat, lon, nearest_school, nearest_school_km, nearest_school_min,
+        broker_name, broker_office, broker_profile_url, broker_source_domain
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data["url"], data["adresse"], data["postnummer"], data["by"],
         data["pris"], data["felleskost"], data["soverom"], data["leie"],
@@ -792,6 +1416,10 @@ def lagre_bolig(data):
         skoledata["nearest_school"],
         skoledata["nearest_school_km"],
         skoledata["nearest_school_min"],
+        data.get("broker_name"),
+        data.get("broker_office"),
+        data.get("broker_profile_url"),
+        data.get("broker_source_domain"),
     ))
     
     ny_bolig_id = c.lastrowid
@@ -1161,8 +1789,541 @@ if st.button("Hent fra FINN"):
     st.session_state["ny_image_url"] = data["image_url"]
     st.session_state["ny_eieform"] = data["eieform"]
     st.session_state["ny_solgt"] = bool(data["solgt"])
+    st.session_state["ny_broker_name"] = data.get("broker_name")
+    st.session_state["ny_broker_office"] = data.get("broker_office")
+    st.session_state["ny_broker_profile_url"] = data.get("broker_profile_url")
+    st.session_state["ny_broker_source_domain"] = data.get("broker_source_domain")
 
     st.rerun()
+
+st.caption(f"PDF-er lagres i mappen: `{os.path.join('data', 'salgsoppgaver')}/`")
+
+if st.button("Hent salgsoppgave"):
+    result, _debug_info = hent_salgsoppgave_med_broker_fallback(
+        url,
+        adresse=st.session_state.get("ny_adresse", ""),
+        postnummer=st.session_state.get("ny_postnummer", ""),
+        by=st.session_state.get("ny_by", ""),
+    )
+    lagre_salgsoppgave_forsok(result)
+
+    if is_downloaded_status(result.status):
+        kilde_tekst = "FINN-annonsen" if result.status == "found_from_finn" else "meglerens nettside"
+        st.success(f"Salgsoppgave funnet og lastet ned (kilde: {kilde_tekst}).")
+        st.write("**Full filsti (Vis filplassering / Åpne mappe):**")
+        st.code(os.path.abspath(result.local_pdf_path), language=None)
+
+        try:
+            with open(result.local_pdf_path, "rb") as f:
+                st.download_button(
+                    "Last ned PDF",
+                    data=f.read(),
+                    file_name=os.path.basename(result.local_pdf_path),
+                    mime="application/pdf",
+                    key=f"dl_single_{result.finn_ad_id or result.finn_url}",
+                )
+        except OSError as e:
+            st.warning(f"Fant ikke filen på disk for nedlasting: {e}")
+    elif result.status in DOCUMENT_URL_ONLY_STATUSES:
+        st.info("Salgsoppgave funnet, men må åpnes som digital salgsoppgave.")
+        if result.found_document_url:
+            st.link_button("Åpne digital salgsoppgave", result.found_document_url)
+        if result.salgsoppgave_source_detail:
+            st.caption(result.salgsoppgave_source_detail)
+    elif result.status == STATUS_LISTING_SOLD_OR_INACTIVE:
+        st.warning("Boligen ser ut til å være solgt/ikke lenger aktiv hos megler.")
+        if result.salgsoppgave_source_detail:
+            st.caption(result.salgsoppgave_source_detail)
+    elif result.status == "not_found":
+        st.warning("Fant ikke salgsoppgave for denne annonsen.")
+        if result.broker_listing_url:
+            st.write(f"**Fant meglerannonse (uten nedlastbar PDF):** {result.broker_listing_url}")
+        if result.salgsoppgave_source_detail:
+            st.caption(result.salgsoppgave_source_detail)
+    else:
+        st.error(f"Klarte ikke å hente salgsoppgave: {result.error_message}")
+
+    if result.status != "error":
+        if result.broker_name or result.broker_source_domain:
+            st.write(
+                f"**Megler:** {result.broker_name or 'Ukjent navn'}"
+                + (f" ({result.broker_source_domain})" if result.broker_source_domain else "")
+            )
+        if result.broker_listing_url:
+            st.write(f"**Meglerannonse:** {result.broker_listing_url}")
+
+        if result.tilstandsrapport_local_path and os.path.exists(result.tilstandsrapport_local_path):
+            try:
+                with open(result.tilstandsrapport_local_path, "rb") as f:
+                    st.download_button(
+                        "Last ned tilstandsrapport",
+                        data=f.read(),
+                        file_name=os.path.basename(result.tilstandsrapport_local_path),
+                        mime="application/pdf",
+                        key=f"dl_single_tilstandsrapport_{result.finn_ad_id or result.finn_url}",
+                    )
+            except OSError:
+                pass
+        elif result.tilstandsrapport_document_url:
+            st.link_button("Åpne digital tilstandsrapport", result.tilstandsrapport_document_url)
+
+
+st.subheader("Batch: salgsoppgaver for nylige boliger")
+
+batch_limit = st.number_input(
+    "Antall nylige boliger å sjekke", value=20, min_value=1, step=1, key="batch_salgsoppgave_limit"
+)
+batch_overskriv = st.checkbox(
+    "Prøv på nytt / overskriv", value=False, key="batch_salgsoppgave_overskriv"
+)
+
+st.caption(f"PDF-er lagres i mappen: `{os.path.join('data', 'salgsoppgaver')}/`")
+
+if st.button("Hent salgsoppgaver for nylige boliger"):
+    boliger_a_sjekke = hent_nylige_boliger_med_url(limit=int(batch_limit))
+
+    resultater = []
+    antall_checked = 0
+    antall_downloaded = 0
+    antall_digital = 0
+    antall_not_found = 0
+    antall_error = 0
+
+    total = len(boliger_a_sjekke)
+    progress = st.progress(0)
+
+    for i, (bolig_id, bolig_url, adresse, postnummer, by) in enumerate(boliger_a_sjekke):
+        antall_checked += 1
+        adresse_visning = ", ".join(filter(None, [adresse, f"{postnummer} {by}".strip()]))
+
+        try:
+            finn_ad_id = extract_finn_ad_id(bolig_url)
+
+            eksisterende = None
+            if not batch_overskriv:
+                eksisterende = hent_siste_vellykkede_salgsoppgave(finn_ad_id, bolig_url)
+
+            if (
+                eksisterende
+                and eksisterende["local_pdf_path"]
+                and os.path.exists(eksisterende["local_pdf_path"])
+            ):
+                antall_downloaded += 1
+                resultater.append({
+                    "adresse": adresse_visning,
+                    "finn_url": bolig_url,
+                    "finn_ad_id": eksisterende["finn_ad_id"] or finn_ad_id,
+                    "broker_name": eksisterende.get("broker_name"),
+                    "broker_source_domain": eksisterende.get("broker_source_domain"),
+                    "broker_listing_url": eksisterende.get("broker_listing_url"),
+                    "salgsoppgave_status": eksisterende["status"],
+                    "salgsoppgave_document_url": eksisterende.get("found_document_url"),
+                    "salgsoppgave_local_path": eksisterende["local_pdf_path"],
+                    "tilstandsrapport_status": eksisterende.get("tilstandsrapport_download_status"),
+                    "tilstandsrapport_document_url": eksisterende.get("tilstandsrapport_document_url"),
+                    "tilstandsrapport_local_path": eksisterende.get("tilstandsrapport_local_path"),
+                    "error_message": "Allerede lastet ned tidligere (hoppet over)",
+                })
+                continue
+
+            result, _debug_info = hent_salgsoppgave_med_broker_fallback(bolig_url, adresse, postnummer, by)
+            lagre_salgsoppgave_forsok(result)
+
+            bucket = status_bucket(result.status)
+            if bucket == "downloaded":
+                antall_downloaded += 1
+            elif bucket == "digital":
+                antall_digital += 1
+            elif bucket == "not_found":
+                antall_not_found += 1
+            else:
+                antall_error += 1
+
+            resultater.append(resultat_rad_fra_result(adresse_visning, result))
+
+            time.sleep(1.5)
+
+        except Exception as e:
+            antall_error += 1
+            resultater.append(resultat_rad_uventet_feil(adresse_visning, bolig_url, f"Uventet feil: {e}"))
+
+        progress.progress((i + 1) / total if total else 1.0)
+
+    st.success(
+        f"Sjekket {antall_checked} boliger. "
+        f"{antall_downloaded} lastet ned, {antall_digital} funnet som digital salgsoppgave, "
+        f"{antall_not_found} ikke funnet, {antall_error} feilet."
+    )
+
+    if resultater:
+        st.dataframe(
+            pd.DataFrame(resultater)[RESULTAT_TABELL_KOLONNER],
+            use_container_width=True,
+            column_config={
+                "salgsoppgave_local_path": st.column_config.TextColumn("salgsoppgave_local_path", width="large"),
+                "salgsoppgave_document_url": st.column_config.TextColumn("salgsoppgave_document_url", width="large"),
+                "tilstandsrapport_local_path": st.column_config.TextColumn("tilstandsrapport_local_path", width="large"),
+                "tilstandsrapport_document_url": st.column_config.TextColumn("tilstandsrapport_document_url", width="large"),
+                "error_message": st.column_config.TextColumn("error_message", width="large"),
+            },
+        )
+
+        nedlastede = [
+            r for r in resultater
+            if is_downloaded_status(r["salgsoppgave_status"])
+            and r["salgsoppgave_local_path"] and os.path.exists(r["salgsoppgave_local_path"])
+        ]
+
+        if nedlastede:
+            st.write("**Last ned enkeltfiler:**")
+            for r in nedlastede:
+                try:
+                    with open(r["salgsoppgave_local_path"], "rb") as f:
+                        st.download_button(
+                            f"⬇ {r['adresse'] or r['finn_ad_id'] or r['finn_url']}",
+                            data=f.read(),
+                            file_name=os.path.basename(r["salgsoppgave_local_path"]),
+                            mime="application/pdf",
+                            key=f"dl_batch_{r['finn_ad_id'] or r['finn_url']}",
+                        )
+                except OSError:
+                    continue
+
+
+st.subheader("Backfill/test: megler og salgsoppgave for manglende boliger")
+st.caption(
+    "Finner opptil 20 boliger med FINN-url som mangler megler-info og/eller "
+    "salgsoppgave, og prøver å hente dette på nytt. Nyttig for å teste at "
+    "megler-gjenkjenning og salgsoppgave-nedlasting fungerer."
+)
+
+if st.button("Oppdater 20 manglende boliger"):
+    boliger_mangler = hent_boliger_med_manglende_data(limit=20)
+
+    backfill_resultater = []
+    backfill_checked = 0
+    backfill_broker_found = 0
+    backfill_downloaded = 0
+    backfill_digital = 0
+    backfill_not_found = 0
+    backfill_error = 0
+
+    total_mangler = len(boliger_mangler)
+    backfill_progress = st.progress(0)
+    backfill_status_text = st.empty()
+
+    for i, (bolig_id, bolig_url, adresse, postnummer, by) in enumerate(boliger_mangler):
+        backfill_checked += 1
+        adresse_visning = ", ".join(filter(None, [adresse, f"{postnummer} {by}".strip()]))
+        backfill_status_text.write(f"Sjekker {i + 1}/{total_mangler}: {adresse_visning or bolig_url}")
+
+        try:
+            result, _debug_info = hent_salgsoppgave_med_broker_fallback(bolig_url, adresse, postnummer, by)
+            lagre_salgsoppgave_forsok(result)
+
+            if result.broker_name or result.broker_source_domain:
+                backfill_broker_found += 1
+
+            bucket = status_bucket(result.status)
+            if bucket == "downloaded":
+                backfill_downloaded += 1
+            elif bucket == "digital":
+                backfill_digital += 1
+            elif bucket == "not_found":
+                backfill_not_found += 1
+            else:
+                backfill_error += 1
+
+            backfill_resultater.append(resultat_rad_fra_result(adresse_visning, result))
+
+        except Exception as e:
+            backfill_error += 1
+            backfill_resultater.append(resultat_rad_uventet_feil(adresse_visning, bolig_url, f"Uventet feil: {e}"))
+
+        backfill_progress.progress((i + 1) / total_mangler if total_mangler else 1.0)
+        time.sleep(1.5)
+
+    backfill_status_text.empty()
+
+    st.success(
+        f"Sjekket {backfill_checked} boliger. "
+        f"{backfill_broker_found} meglere funnet, {backfill_downloaded} salgsoppgaver lastet ned, "
+        f"{backfill_digital} funnet som digital salgsoppgave, "
+        f"{backfill_not_found} ikke funnet, {backfill_error} feilet."
+    )
+
+    if backfill_resultater:
+        st.dataframe(
+            pd.DataFrame(backfill_resultater)[RESULTAT_TABELL_KOLONNER],
+            use_container_width=True,
+            column_config={
+                "salgsoppgave_local_path": st.column_config.TextColumn("salgsoppgave_local_path", width="large"),
+                "salgsoppgave_document_url": st.column_config.TextColumn("salgsoppgave_document_url", width="large"),
+                "tilstandsrapport_local_path": st.column_config.TextColumn("tilstandsrapport_local_path", width="large"),
+                "tilstandsrapport_document_url": st.column_config.TextColumn("tilstandsrapport_document_url", width="large"),
+                "error_message": st.column_config.TextColumn("error_message", width="large"),
+            },
+        )
+    else:
+        st.info("Fant ingen boliger med manglende megler- eller salgsoppgave-data.")
+
+
+st.subheader("Full backfill: megler og salgsoppgave for HELE databasen")
+st.caption(
+    "Går gjennom alle boliger med gyldig FINN-url. Boliger som allerede har "
+    "både megler-navn og en nedlastet salgsoppgave hoppes automatisk over - "
+    "hvis prosessen blir avbrutt (f.eks. lukket fane eller feil), kan du bare "
+    "trykke på knappen igjen for å fortsette der den stoppet."
+)
+
+full_backfill_delay = st.number_input(
+    "Forsinkelse mellom forespørsler (sekunder)",
+    value=1.0, min_value=0.2, step=0.5, key="full_backfill_delay"
+)
+full_backfill_force = st.checkbox(
+    "Force re-check (ignorer tidligere resultater og sjekk alle på nytt)",
+    value=False, key="full_backfill_force"
+)
+
+antall_full_backfill = len(hent_alle_boliger_for_full_backfill(force_recheck=full_backfill_force))
+st.caption(f"{antall_full_backfill} boliger vil bli behandlet med gjeldende innstillinger.")
+
+if st.button("Oppdater hele databasen"):
+    boliger_full = hent_alle_boliger_for_full_backfill(force_recheck=full_backfill_force)
+
+    full_checked = 0
+    full_broker_found = 0
+    full_downloaded = 0
+    full_digital = 0
+    full_not_found = 0
+    full_error = 0
+    full_resultater = []
+
+    total_full = len(boliger_full)
+    full_progress = st.progress(0)
+    full_status_text = st.empty()
+    start_time = time.time()
+
+    for i, (bolig_id, bolig_url, adresse, postnummer, by) in enumerate(boliger_full):
+        full_checked += 1
+        adresse_visning = ", ".join(filter(None, [adresse, f"{postnummer} {by}".strip()]))
+
+        elapsed = time.time() - start_time
+        if i > 0:
+            snitt_per_stk = elapsed / i
+            gjenstaende_sek = snitt_per_stk * (total_full - i)
+            eta_tekst = f"{int(gjenstaende_sek // 60)} min {int(gjenstaende_sek % 60)} sek"
+        else:
+            eta_tekst = "beregner..."
+
+        full_status_text.write(
+            f"Behandler {i + 1}/{total_full}: {adresse_visning or bolig_url}  \n"
+            f"Estimert gjenstående tid: {eta_tekst}"
+        )
+
+        try:
+            result, _debug_info = hent_salgsoppgave_med_broker_fallback(bolig_url, adresse, postnummer, by)
+            lagre_salgsoppgave_forsok(result)
+
+            if result.broker_name or result.broker_source_domain:
+                full_broker_found += 1
+
+            bucket = status_bucket(result.status)
+            if bucket == "downloaded":
+                full_downloaded += 1
+            elif bucket == "digital":
+                full_digital += 1
+            elif bucket == "not_found":
+                full_not_found += 1
+            else:
+                full_error += 1
+
+            full_resultater.append(resultat_rad_fra_result(adresse_visning, result))
+
+        except Exception as e:
+            full_error += 1
+            full_resultater.append(resultat_rad_uventet_feil(adresse_visning, bolig_url, f"Uventet feil: {e}"))
+
+        full_progress.progress((i + 1) / total_full if total_full else 1.0)
+        time.sleep(full_backfill_delay)
+
+    full_status_text.empty()
+
+    total_runtime_sek = time.time() - start_time
+    runtime_tekst = f"{int(total_runtime_sek // 60)} min {int(total_runtime_sek % 60)} sek"
+
+    st.success(
+        f"Sjekket {full_checked} boliger på {runtime_tekst}. "
+        f"{full_broker_found} meglere funnet, {full_downloaded} salgsoppgaver lastet ned, "
+        f"{full_digital} funnet som digital salgsoppgave, "
+        f"{full_not_found} ikke funnet, {full_error} feilet."
+    )
+
+    if full_resultater:
+        st.dataframe(
+            pd.DataFrame(full_resultater)[RESULTAT_TABELL_KOLONNER],
+            use_container_width=True,
+            column_config={
+                "salgsoppgave_local_path": st.column_config.TextColumn("salgsoppgave_local_path", width="large"),
+                "salgsoppgave_document_url": st.column_config.TextColumn("salgsoppgave_document_url", width="large"),
+                "tilstandsrapport_local_path": st.column_config.TextColumn("tilstandsrapport_local_path", width="large"),
+                "tilstandsrapport_document_url": st.column_config.TextColumn("tilstandsrapport_document_url", width="large"),
+                "error_message": st.column_config.TextColumn("error_message", width="large"),
+            },
+        )
+    else:
+        st.info("Ingen boliger å behandle (alle er allerede fullført, eller ingen har gyldig FINN-url).")
+
+
+st.subheader("Test broker fallback")
+st.caption(
+    "Kjør kun megler-fallback-flyten for én FINN-url og se hvert steg i detalj - "
+    "for feilsøking/tuning av søke-mønstre og adressematching. Påvirker ikke de "
+    "andre knappene på siden."
+)
+
+test_broker_url = st.text_input("FINN URL å teste", key="test_broker_url")
+
+t1, t2 = st.columns(2)
+with t1:
+    test_broker_debug_mode = st.checkbox("Debug-modus (vis alle detaljer)", value=True, key="test_broker_debug_mode")
+with t2:
+    test_broker_save = st.checkbox("Save result to bolig database", value=False, key="test_broker_save")
+
+if st.button("Kjør test", key="test_broker_run"):
+    try:
+        finn_data = scrape_finn(test_broker_url)
+    except Exception as e:
+        finn_data = None
+        st.error(f"Klarte ikke å hente FINN-annonsen: {e}")
+
+    if finn_data:
+        result, debug_info = hent_salgsoppgave_med_broker_fallback(
+            test_broker_url,
+            adresse=finn_data.get("adresse", ""),
+            postnummer=finn_data.get("postnummer", ""),
+            by=finn_data.get("by", ""),
+        )
+
+        if test_broker_save:
+            lagre_salgsoppgave_forsok(result)
+            st.info("Lagret: bolig-raden er oppdatert og forsøket er logget i salgsoppgave_forsok.")
+        else:
+            st.info("Kun test - ingenting er lagret i databasen (huk av \"Save result to bolig database\" for å lagre).")
+
+        if is_downloaded_status(result.status):
+            st.success(f"Endelig status: {result.status} (kilde: {result.salgsoppgave_source})")
+        elif result.status in DOCUMENT_URL_ONLY_STATUSES:
+            st.info(f"Endelig status: {result.status} - fant en dokumentlenke, men ikke en direkte nedlastbar PDF.")
+        elif result.status == STATUS_LISTING_SOLD_OR_INACTIVE:
+            st.warning("Endelig status: listing_sold_or_inactive - boligen ser ut til å være solgt/ikke lenger aktiv.")
+        elif result.status == "not_found":
+            st.warning("Endelig status: not_found - fant ikke salgsoppgave verken på FINN eller hos megler.")
+        else:
+            st.error(f"Endelig status: error - {result.error_message}")
+
+        st.write("### Debug-informasjon")
+        st.write(f"**finn_url:** {result.finn_url}")
+        st.write(f"**finn_ad_id:** {result.finn_ad_id or '-'}")
+        st.write(f"**Adresse:** {finn_data.get('adresse') or '-'}")
+        st.write(f"**Postnummer:** {finn_data.get('postnummer') or '-'}")
+        st.write(f"**By:** {finn_data.get('by') or '-'}")
+        st.write(f"**Megler-navn:** {result.broker_name or '-'}")
+        st.write(f"**Megler-domene:** {result.broker_source_domain or '-'}")
+        st.write(f"**FINN-annonse aktiv:** {result.finn_listing_active}")
+        st.write(f"**FINN salgsoppgave-status (før evt. megler-fallback):** {debug_info['finn_status']}")
+        st.write(
+            f"**\"Se komplett salgsoppgave\"-lenke funnet på FINN:** "
+            f"{debug_info['broker_property_link'] or '(ingen - bruker adressesøk-fallback hvis megler er kjent)'}"
+        )
+
+        if test_broker_debug_mode:
+            st.write(f"**FINN-detalj:** {debug_info['finn_source_detail'] or '-'}")
+            st.write(f"**Megler-fallback forsøkt:** {debug_info['broker_attempted']}")
+            st.write(
+                f"**Strategi brukt:** "
+                f"{ {'direct_link': 'Direktelenke fra FINN', 'address_search': 'Adressesøk (fallback)'}.get(debug_info['broker_link_strategy'], '-') }"
+            )
+
+            if debug_info["broker_skip_reason"]:
+                st.write(f"**Grunn til at megler-fallback ble hoppet over:** {debug_info['broker_skip_reason']}")
+
+            if debug_info["broker_attempted"]:
+                if debug_info["broker_link_strategy"] == "address_search":
+                    st.write("**Megler-søke-URL-er forsøkt:**")
+                    if debug_info["broker_search_urls_attempted"]:
+                        st.code("\n".join(debug_info["broker_search_urls_attempted"]), language=None)
+                    else:
+                        st.write("- (ingen)")
+
+                    st.write("**Kandidat-annonse-URL-er funnet hos megler:**")
+                    if debug_info["broker_candidate_urls"]:
+                        st.code("\n".join(debug_info["broker_candidate_urls"]), language=None)
+                    else:
+                        st.write("- (ingen)")
+
+                    st.write("**Vurdering av hver kandidat (godtatt/avvist og hvorfor):**")
+                    if debug_info["broker_candidate_evaluations"]:
+                        st.dataframe(
+                            pd.DataFrame(debug_info["broker_candidate_evaluations"]),
+                            use_container_width=True,
+                            column_config={
+                                "url": st.column_config.TextColumn("url", width="large"),
+                                "reason": st.column_config.TextColumn("reason", width="large"),
+                            },
+                        )
+                    else:
+                        st.write("- (ingen kandidater ble sjekket)")
+
+                st.write("**Dokumenter funnet på meglersiden (type/url/tekst):**")
+                if debug_info["broker_doc_links_found"]:
+                    st.dataframe(
+                        pd.DataFrame(debug_info["broker_doc_links_found"]),
+                        use_container_width=True,
+                        column_config={"url": st.column_config.TextColumn("url", width="large")},
+                    )
+                else:
+                    st.write("- (ingen, eller ingen meglerside ble godtatt)")
+
+        st.write(f"**broker_listing_url (broker property URL):** {result.broker_listing_url or '-'}")
+        st.write(f"**Endelig salgsoppgave-status:** {result.status}")
+        st.write(f"**salgsoppgave_source:** {result.salgsoppgave_source or '-'}")
+        st.write(f"**salgsoppgave_source_detail:** {result.salgsoppgave_source_detail or '-'}")
+        st.write(f"**salgsoppgave_document_url:** {result.found_document_url or '-'}")
+        st.write(f"**local_pdf_path (salgsoppgave):** {result.local_pdf_path or '-'}")
+        st.write(f"**tilstandsrapport_status:** {result.tilstandsrapport_status or '-'}")
+        st.write(f"**tilstandsrapport_document_url:** {result.tilstandsrapport_document_url or '-'}")
+        st.write(f"**tilstandsrapport_local_path:** {result.tilstandsrapport_local_path or '-'}")
+
+        if result.local_pdf_path and os.path.exists(result.local_pdf_path):
+            try:
+                with open(result.local_pdf_path, "rb") as f:
+                    st.download_button(
+                        "Last ned salgsoppgave",
+                        data=f.read(),
+                        file_name=os.path.basename(result.local_pdf_path),
+                        mime="application/pdf",
+                        key="dl_test_broker_salgsoppgave",
+                    )
+            except OSError:
+                pass
+        elif result.found_document_url:
+            st.link_button("Åpne digital salgsoppgave", result.found_document_url, key="open_test_broker_salgsoppgave")
+
+        if result.tilstandsrapport_local_path and os.path.exists(result.tilstandsrapport_local_path):
+            try:
+                with open(result.tilstandsrapport_local_path, "rb") as f:
+                    st.download_button(
+                        "Last ned tilstandsrapport",
+                        data=f.read(),
+                        file_name=os.path.basename(result.tilstandsrapport_local_path),
+                        mime="application/pdf",
+                        key="dl_test_broker_tilstandsrapport",
+                    )
+            except OSError:
+                pass
+        elif result.tilstandsrapport_document_url:
+            st.link_button("Åpne digital tilstandsrapport", result.tilstandsrapport_document_url, key="open_test_broker_tilstandsrapport")
 
 
 data = {
@@ -1180,6 +2341,10 @@ data = {
     "image_url": st.session_state.get("ny_image_url", ""),
     "eieform": st.session_state.get("ny_eieform", "Ukjent"),
     "solgt": st.session_state.get("ny_solgt", 0),
+    "broker_name": st.session_state.get("ny_broker_name"),
+    "broker_office": st.session_state.get("ny_broker_office"),
+    "broker_profile_url": st.session_state.get("ny_broker_profile_url"),
+    "broker_source_domain": st.session_state.get("ny_broker_source_domain"),
 }
 
 if data["image_url"]:
@@ -1223,6 +2388,10 @@ if st.button("Lagre ny bolig"):
         "image_url": data["image_url"],
         "eieform": eieform,
         "solgt": 1 if solgt else 0,
+        "broker_name": data.get("broker_name"),
+        "broker_office": data.get("broker_office"),
+        "broker_profile_url": data.get("broker_profile_url"),
+        "broker_source_domain": data.get("broker_source_domain"),
     }
 
     lagret, bolig_id = lagre_bolig(ny_data)
@@ -1286,7 +2455,9 @@ with u2:
 
 
 rows = c.execute("""
-SELECT id, url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre, image_url, eieform, solgt, lat, lon, nearest_school, nearest_school_km, nearest_school_min
+SELECT id, url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre, image_url, eieform, solgt, lat, lon, nearest_school, nearest_school_km, nearest_school_min,
+       broker_name, broker_source_domain, salgsoppgave_status, salgsoppgave_local_path, broker_listing_url, tilstandsrapport_local_path,
+       salgsoppgave_document_url, tilstandsrapport_document_url
 FROM boliger
 ORDER BY id DESC
 """).fetchall()
@@ -1329,7 +2500,7 @@ if st.button("Slett alle boliger"):
 boliger = []
 
 for row in rows:
-    bolig_id, saved_url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre, image_url, eieform, solgt, lat, lon, nearest_school, nearest_school_km, nearest_school_min = row
+    bolig_id, saved_url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre, image_url, eieform, solgt, lat, lon, nearest_school, nearest_school_km, nearest_school_min, broker_name, broker_source_domain, salgsoppgave_status, salgsoppgave_local_path, broker_listing_url, tilstandsrapport_local_path, salgsoppgave_document_url, tilstandsrapport_document_url = row
 
     pris = pris or 0
     felleskost = felleskost or 0
@@ -1390,6 +2561,14 @@ for row in rows:
         "nearest_school": nearest_school,
         "nearest_school_km": nearest_school_km,
         "nearest_school_min": nearest_school_min,
+        "broker_name": broker_name,
+        "broker_source_domain": broker_source_domain,
+        "salgsoppgave_status": salgsoppgave_status,
+        "salgsoppgave_local_path": salgsoppgave_local_path,
+        "broker_listing_url": broker_listing_url,
+        "tilstandsrapport_local_path": tilstandsrapport_local_path,
+        "salgsoppgave_document_url": salgsoppgave_document_url,
+        "tilstandsrapport_document_url": tilstandsrapport_document_url,
         "netto_etter_lan": netto_etter_lan,
         "yield_pct": yield_pct,
         "hopp": hopp,
@@ -1519,6 +2698,68 @@ for b in boliger[start_idx:end_idx]:
                 )
             else:
                 st.write("**Nærmeste skole:** Ikke beregnet")
+
+            if b.get("broker_name") or b.get("broker_source_domain"):
+                st.write(f"**Megler:** {b.get('broker_name') or 'Ukjent navn'}")
+                if b.get("broker_source_domain"):
+                    st.write(f"**Meglerhus/domene:** {b['broker_source_domain']}")
+                if b.get("broker_listing_url"):
+                    st.write(f"**Meglerannonse (broker property URL):** {b['broker_listing_url']}")
+
+            salgsoppgave_status_visning = {
+                "found_from_finn": "Funnet (FINN)",
+                "found_from_broker_site": "Funnet (meglerside)",
+                STATUS_LINK_FOUND_NOT_PDF: "Funnet (digital salgsoppgave)",
+                STATUS_INVALID_PDF_RESPONSE: "Funnet (uventet dokumentformat)",
+                STATUS_LISTING_SOLD_OR_INACTIVE: "Solgt/ikke lenger aktiv",
+                "not_found": "Ikke funnet",
+                "error": "Feil ved sjekk",
+            }.get(b.get("salgsoppgave_status"), "Ikke sjekket")
+
+            st.write(f"**Salgsoppgave:** {salgsoppgave_status_visning}")
+
+            salgsoppgave_path = b.get("salgsoppgave_local_path")
+            salgsoppgave_url = b.get("salgsoppgave_document_url")
+
+            if salgsoppgave_path and os.path.exists(salgsoppgave_path):
+                try:
+                    with open(salgsoppgave_path, "rb") as f:
+                        st.download_button(
+                            "Last ned salgsoppgave",
+                            data=f.read(),
+                            file_name=os.path.basename(salgsoppgave_path),
+                            mime="application/pdf",
+                            key=f"dl_card_salgsoppgave_{b['id']}",
+                        )
+                except OSError:
+                    pass
+            elif salgsoppgave_url:
+                st.link_button("Åpne digital salgsoppgave", salgsoppgave_url, key=f"open_card_salgsoppgave_{b['id']}")
+            else:
+                st.write("Ikke funnet")
+
+            tilstandsrapport_path = b.get("tilstandsrapport_local_path")
+            tilstandsrapport_url = b.get("tilstandsrapport_document_url")
+            tilstandsrapport_funnet = bool(tilstandsrapport_path and os.path.exists(tilstandsrapport_path))
+
+            st.write(f"**Tilstandsrapport:** {'Funnet' if (tilstandsrapport_funnet or tilstandsrapport_url) else 'Ikke funnet'}")
+
+            if tilstandsrapport_funnet:
+                try:
+                    with open(tilstandsrapport_path, "rb") as f:
+                        st.download_button(
+                            "Last ned tilstandsrapport",
+                            data=f.read(),
+                            file_name=os.path.basename(tilstandsrapport_path),
+                            mime="application/pdf",
+                            key=f"dl_card_tilstandsrapport_{b['id']}",
+                        )
+                except OSError:
+                    pass
+            elif tilstandsrapport_url:
+                st.link_button("Åpne digital tilstandsrapport", tilstandsrapport_url, key=f"open_card_tilstandsrapport_{b['id']}")
+            else:
+                st.write("Ikke funnet")
 
             with st.expander("Åpne / rediger bolig"):
                 st.info("Redigering av boligdata beholdes som før. Avstand beregnes automatisk når ny bolig lagres.")
