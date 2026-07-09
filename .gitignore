@@ -45,3 +45,6 @@ Thumbs.db
 
 # --- Downloaded documents (local cache) ---
 data/
+
+# --- Local machine-specific config (dashboard sync paths) ---
+dashboard_sync_config.json

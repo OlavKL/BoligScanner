@@ -41,6 +41,7 @@ from broker_document_parser import (
     CONDITION_REPORT_DOCUMENT_TYPES,
 )
 from document_parser import analyze_salgsoppgave_pdf, COMPONENT_ORDER, COMPONENT_DISPLAY_NAVN
+import dashboard_sync
 
 # Statuser (for både salgsoppgave og tilstandsrapport) som betyr "et dokument
 # ble funnet, men ikke lastet ned som en direkte PDF" - fortsatt et FUNN, bare
@@ -2366,6 +2367,154 @@ if st.button("Kjør test", key="test_broker_run"):
                 pass
         elif result.tilstandsrapport_document_url:
             st.link_button("Åpne digital tilstandsrapport", result.tilstandsrapport_document_url, key="open_test_broker_tilstandsrapport")
+
+
+def bygg_dashboard_synk_poster(rente, nedbetaling_ar, ek_prosent, bruk_makslaan, maks_laan):
+    """Bygger listen med bolig-poster (dicts) som skal synkes til Dashboard-
+    databasen. yield/netto/kapitalbehov beregnes her med de samme
+    finansieringsforutsetningene som er satt i sidebaren akkurat nå, slik at
+    Dashboard-prosjektet slipper å implementere egen finansieringslogikk."""
+    rows = c.execute("""
+    SELECT url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre,
+           image_url, eieform, solgt,
+           broker_name, broker_office, broker_profile_url, broker_source_domain, broker_listing_url,
+           salgsoppgave_status, salgsoppgave_local_path, salgsoppgave_document_url,
+           tilstandsrapport_download_status, tilstandsrapport_local_path, tilstandsrapport_document_url,
+           document_analysis_json
+    FROM boliger
+    ORDER BY id
+    """).fetchall()
+
+    poster = []
+
+    for row in rows:
+        (
+            url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre,
+            image_url, eieform, solgt,
+            broker_name, broker_office, broker_profile_url, broker_source_domain, broker_listing_url,
+            salgsoppgave_status, salgsoppgave_local_path, salgsoppgave_document_url,
+            tilstandsrapport_status, tilstandsrapport_local_path, tilstandsrapport_document_url,
+            document_analysis_json,
+        ) = row
+
+        pris = pris or 0
+        felleskost = felleskost or 0
+        soverom = soverom or 0
+        leie = leie or 0
+        strom = strom or 0
+        kommunale = kommunale or 0
+        andre = andre or 0
+        eieform = eieform or "Ukjent"
+
+        _, _, netto_etter_lan, yield_pct, _, kapital = beregn_tall(
+            pris, felleskost, leie, strom, kommunale, andre, eieform,
+            rente, nedbetaling_ar, ek_prosent, bruk_makslaan, maks_laan,
+        )
+
+        poster.append({
+            "finn_ad_id": extract_finn_ad_id(url) if url else None,
+            "finn_url": url,
+            "adresse": adresse,
+            "postnummer": postnummer,
+            "by": by,
+            "eieform": eieform,
+            "solgt": solgt or 0,
+            "pris": pris,
+            "felleskost": felleskost,
+            "soverom": soverom,
+            "leie": leie,
+            "yield_pct": round(yield_pct, 2) if yield_pct is not None else None,
+            "netto_etter_lan": round(netto_etter_lan, 2) if netto_etter_lan is not None else None,
+            "kapitalbehov": round(kapital["kapitalbehov"], 2) if kapital else None,
+            "broker_name": broker_name,
+            "broker_office": broker_office,
+            "broker_profile_url": broker_profile_url,
+            "broker_source_domain": broker_source_domain,
+            "broker_listing_url": broker_listing_url,
+            "salgsoppgave_status": salgsoppgave_status,
+            "salgsoppgave_local_path": salgsoppgave_local_path,
+            "salgsoppgave_document_url": salgsoppgave_document_url,
+            "tilstandsrapport_status": tilstandsrapport_status,
+            "tilstandsrapport_local_path": tilstandsrapport_local_path,
+            "tilstandsrapport_document_url": tilstandsrapport_document_url,
+            "document_analysis_json": document_analysis_json,
+            "image_url": image_url,
+            "image_local_path": None,
+        })
+
+    return poster
+
+
+st.divider()
+st.subheader("Oppdater dashboard-database")
+st.caption(
+    "Eksporterer prosessert boligdata fra BoligScanner til en separat "
+    "Dashboard-database (et annet, presentasjons-bare prosjekt på disk). "
+    "BoligScanner er alltid kilden til sannhet - dette leser kun fra "
+    "boliger.db og skriver aldri tilbake hit."
+)
+
+_dashboard_config = dashboard_sync.load_config()
+
+dc1, dc2 = st.columns(2)
+
+with dc1:
+    dashboard_db_path_input = st.text_input(
+        "Sti til dashboard-database (.db-fil)",
+        value=_dashboard_config["dashboard_db_path"],
+        key="dashboard_db_path_input",
+        help="F.eks. C:/Users/.../Dashboard/dashboard.db - opprettes automatisk hvis den ikke finnes.",
+    )
+
+with dc2:
+    dashboard_data_folder_input = st.text_input(
+        "Mappe for kopierte dokumenter (valgfritt)",
+        value=_dashboard_config["dashboard_data_folder"],
+        key="dashboard_data_folder_input",
+        help="La stå tom for å bare lagre de originale filstiene/URL-ene uten å kopiere noe.",
+    )
+
+if st.button("Lagre sti-konfigurasjon", key="dashboard_save_config"):
+    dashboard_sync.save_config(dashboard_db_path_input, dashboard_data_folder_input)
+    st.success("Konfigurasjon lagret.")
+
+dashboard_dry_run = st.checkbox("Test sync uten å skrive", value=True, key="dashboard_dry_run")
+
+dashboard_synk_poster = bygg_dashboard_synk_poster(rente, nedbetaling_ar, ek_prosent, bruk_makslaan, maks_laan)
+
+st.write(f"**{len(dashboard_synk_poster)} boliger klare for synkronisering.**")
+
+if dashboard_synk_poster:
+    forhandsvisning_kolonner = [
+        "adresse", "by", "pris", "yield_pct", "netto_etter_lan",
+        "broker_name", "salgsoppgave_status", "tilstandsrapport_status", "finn_url",
+    ]
+    st.dataframe(
+        pd.DataFrame(dashboard_synk_poster)[forhandsvisning_kolonner],
+        use_container_width=True,
+        column_config={"finn_url": st.column_config.TextColumn("finn_url", width="large")},
+    )
+
+if st.button("Oppdater dashboard-database", key="dashboard_sync_run"):
+    dashboard_sync.save_config(dashboard_db_path_input, dashboard_data_folder_input)
+
+    sammendrag = dashboard_sync.sync_boliger(
+        dashboard_synk_poster,
+        dashboard_db_path_input,
+        data_folder=dashboard_data_folder_input or None,
+        dry_run=dashboard_dry_run,
+    )
+
+    modus_tekst = "Testkjøring (ingenting ble skrevet)" if dashboard_dry_run else "Synkronisering fullført"
+    st.success(
+        f"{modus_tekst}: {sammendrag['total']} totalt, {sammendrag['inserted']} nye, "
+        f"{sammendrag['updated']} oppdatert, {sammendrag['skipped']} hoppet over, "
+        f"{sammendrag['errors']} feilet."
+    )
+
+    if sammendrag["error_details"]:
+        st.error("Noen boliger feilet under synkronisering:")
+        st.dataframe(pd.DataFrame(sammendrag["error_details"]), use_container_width=True)
 
 
 data = {
