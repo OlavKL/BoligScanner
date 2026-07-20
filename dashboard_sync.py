@@ -48,6 +48,12 @@ MANAGED_COLUMNS = [
     ("felleskost", "INTEGER"),
     ("soverom", "INTEGER"),
     ("leie", "INTEGER"),
+    ("strom", "INTEGER"),
+    ("kommunale", "INTEGER"),
+    ("andre", "INTEGER"),
+    ("nearest_school", "TEXT"),
+    ("nearest_school_km", "REAL"),
+    ("nearest_school_min", "REAL"),
     ("yield_pct", "REAL"),
     ("netto_etter_lan", "REAL"),
     ("kapitalbehov", "REAL"),
@@ -144,6 +150,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _har_kolonne(c, tabell: str, kolonne: str) -> bool:
+    cols = [row[1] for row in c.execute(f"PRAGMA table_info({tabell})").fetchall()]
+    return kolonne in cols
+
+
 def _finn_rad_id(c, finn_ad_id: Optional[str], finn_url: Optional[str]) -> Optional[int]:
     if finn_ad_id:
         row = c.execute("SELECT id FROM boliger WHERE finn_ad_id = ?", (finn_ad_id,)).fetchone()
@@ -155,27 +166,55 @@ def _finn_rad_id(c, finn_ad_id: Optional[str], finn_url: Optional[str]) -> Optio
         if row:
             return row[0]
 
+        # Rader satt inn før finn_url-kolonnen fantes - f.eks. en tidligere
+        # manuell kopi av selve scraper-databasen, som allerede har en egen
+        # "url"-kolonne - kan ha URL-en liggende der i stedet. Faller tilbake
+        # til den hvis den finnes, for å unngå å opprette duplikater mot
+        # allerede eksisterende data.
+        if _har_kolonne(c, "boliger", "url"):
+            row = c.execute("SELECT id FROM boliger WHERE url = ?", (finn_url,)).fetchone()
+            if row:
+                return row[0]
+
     return None
 
 
+def _kolonner_og_verdier_for_skriving(c, payload: dict):
+    """MANAGED_COLUMN_NAMES + verdier, pluss - hvis mål-tabellen har en egen,
+    eldre "url"-kolonne (fra før denne modulen fantes) - et speil av
+    finn_url inn i den kolonnen også. Dette holder eventuell eksisterende
+    kode i Dashboard-prosjektet som leser "url" i sync med det vi skriver."""
+    kolonner = list(MANAGED_COLUMN_NAMES)
+    verdier = [payload.get(k) for k in kolonner]
+
+    if "url" not in kolonner and _har_kolonne(c, "boliger", "url"):
+        kolonner.append("url")
+        verdier.append(payload.get("finn_url"))
+
+    return kolonner, verdier
+
+
 def _sett_inn_rad(c, payload: dict) -> None:
-    plassholdere = ", ".join("?" for _ in MANAGED_COLUMN_NAMES)
+    kolonner, verdier = _kolonner_og_verdier_for_skriving(c, payload)
+    plassholdere = ", ".join("?" for _ in kolonner)
     c.execute(f"""
-    INSERT INTO boliger ({", ".join(MANAGED_COLUMN_NAMES)}, last_synced_at)
+    INSERT INTO boliger ({", ".join(kolonner)}, last_synced_at)
     VALUES ({plassholdere}, ?)
-    """, [payload.get(k) for k in MANAGED_COLUMN_NAMES] + [_now_iso()])
+    """, verdier + [_now_iso()])
 
 
 def _oppdater_rad(c, rad_id: int, payload: dict) -> None:
-    """Oppdaterer KUN MANAGED_COLUMNS + last_synced_at. Eventuelle andre
-    kolonner som finnes i dashboard-databasens egen boliger-tabell (lagt til
-    utenfor denne modulen) blir aldri rørt, og overlever dermed synken."""
-    set_klausul = ", ".join(f"{k} = ?" for k in MANAGED_COLUMN_NAMES)
+    """Oppdaterer KUN MANAGED_COLUMNS (+ evt. en eldre "url"-kolonne, se over)
+    og last_synced_at. Eventuelle andre kolonner som finnes i
+    dashboard-databasens egen boliger-tabell (lagt til utenfor denne
+    modulen) blir aldri rørt, og overlever dermed synken."""
+    kolonner, verdier = _kolonner_og_verdier_for_skriving(c, payload)
+    set_klausul = ", ".join(f"{k} = ?" for k in kolonner)
     c.execute(f"""
     UPDATE boliger
     SET {set_klausul}, last_synced_at = ?
     WHERE id = ?
-    """, [payload.get(k) for k in MANAGED_COLUMN_NAMES] + [_now_iso(), rad_id])
+    """, verdier + [_now_iso(), rad_id])
 
 
 def _kopier_dokument_hvis_konfigurert(

@@ -1,0 +1,23 @@
+# Version control / tooling
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+
+# Runtime data - the real files are bind-mounted in via docker-compose.yml,
+# not baked into the image (and boliger.db/data/ are large/personal).
+boliger.db
+boliger.db.backup_*
+data/
+
+# Secrets - never baked into the image, always mounted at runtime.
+token.json
+credentials.json
+.streamlit/secrets.toml
+dashboard_sync_config.json
+.env
+.env.*

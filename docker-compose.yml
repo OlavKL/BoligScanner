@@ -1,0 +1,39 @@
+services:
+  # Interaktiv UI - kun for manuelt bruk (justere sliders, se boliger, trykke
+  # knapper). Kjører IKKE lenger noen bakgrunnsjobb selv - se worker under.
+  boligscanner:
+    build: .
+    container_name: boligscanner
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      # Whole project mounted in: boliger.db, data/ (downloaded salgsoppgaver),
+      # token.json, credentials.json, .streamlit/secrets.toml and
+      # dashboard_sync_config.json all live on the host and are read/written
+      # here directly - nothing is baked into the image, and a code change
+      # (e.g. app.py) takes effect on the next `docker compose restart`
+      # without needing a rebuild.
+      - .:/app
+    environment:
+      - TZ=Europe/Oslo
+
+  # Alltid-på bakgrunnsprosess: daglig boligscan (08:00) + Gmail-helsesjekk
+  # (12:00) + innhenting ved oppstart hvis dagens scan ikke har kjørt ennå.
+  # Helt uavhengig av om noen noensinne åpner boligscanner-tjenesten over i en
+  # nettleser - dette var selve grunnen til at denne tjenesten finnes (se
+  # worker.py sin docstring for detaljer på hvorfor).
+  boligscanner-worker:
+    build: .
+    container_name: boligscanner-worker
+    command: ["python", "worker.py"]
+    restart: unless-stopped
+    volumes:
+      - .:/app
+    environment:
+      - TZ=Europe/Oslo
+    # Dockerfile sin HEALTHCHECK curler localhost:8501, som ikke finnes her
+    # (denne tjenesten serverer ingen HTTP) - slå den av for å unngå at den
+    # feilaktig vises som "unhealthy".
+    healthcheck:
+      disable: true
