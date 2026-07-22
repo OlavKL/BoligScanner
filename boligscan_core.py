@@ -24,6 +24,7 @@ på egen hånd.
 """
 
 import base64
+import logging
 import os
 import re
 import sqlite3
@@ -40,6 +41,8 @@ from googleapiclient.discovery import build
 from salgsoppgave_downloader import extract_broker_info
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+logger = logging.getLogger(__name__)
 
 conn = sqlite3.connect("boliger.db", check_same_thread=False)
 c = conn.cursor()
@@ -142,6 +145,23 @@ CREATE TABLE IF NOT EXISTS scan_log (
 )
 """)
 conn.commit()
+
+for col, coltype in [
+    ("gmail_alerts", "INTEGER"),
+    ("finn_urls", "INTEGER"),
+    ("hentet", "INTEGER"),
+    ("avvist", "INTEGER"),
+    ("slack_agder", "INTEGER"),
+    ("slack_default", "INTEGER"),
+    ("slack_feil", "INTEGER"),
+    ("rader_for", "INTEGER"),
+    ("rader_etter", "INTEGER"),
+]:
+    try:
+        c.execute(f"ALTER TABLE scan_log ADD COLUMN {col} {coltype}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 c.execute("""
 CREATE TABLE IF NOT EXISTS salgsoppgave_forsok (
@@ -294,6 +314,11 @@ def beregn_tall(pris, felleskost, leie, strom, kommunale, andre, eieform, rente,
 
 # ---------------- SLACK ----------------
 
+# Steder som skal varsles i #agder-boligscanner i stedet for hovedkanalen.
+AGDER_BYER = {"Kristiansand", "Grimstad"}
+AGDER_MAKS_SKOLE_KM = 10
+
+
 def get_slack_webhook():
     try:
         return st.secrets["SLACK_WEBHOOK_URL"]
@@ -301,8 +326,28 @@ def get_slack_webhook():
         return ""
 
 
-def send_slack_message(text):
-    webhook_url = get_slack_webhook()
+def get_slack_webhook_agder():
+    try:
+        return st.secrets["SLACK_WEBHOOK_URL_AGDER"]
+    except Exception:
+        return ""
+
+
+def velg_slack_webhook(by):
+    """Ruter Kristiansand/Grimstad til Agder-kanalen, alle andre steder til
+    hovedkanalen. Faller tilbake til hovedkanalen hvis Agder-webhooken ikke
+    er satt opp i secrets, slik at varsling ikke stopper opp."""
+    if by in AGDER_BYER:
+        agder_webhook = get_slack_webhook_agder()
+        if agder_webhook:
+            return agder_webhook
+
+    return get_slack_webhook()
+
+
+def send_slack_message(text, webhook_url=None):
+    if webhook_url is None:
+        webhook_url = get_slack_webhook()
 
     if not webhook_url:
         return False, "Mangler SLACK_WEBHOOK_URL i .streamlit/secrets.toml"
@@ -555,6 +600,13 @@ def bolig_matcher_alert(bolig, yield_pct, netto_etter_lan, alert_settings):
         if km > alert_settings["max_skole_km_alert"]:
             return False
 
+    # Agder-varsler (Kristiansand/Grimstad) skal alltid overholde
+    # universitetsavstandskravet, uavhengig av om filteret over er slått på.
+    if bolig["by"] in AGDER_BYER:
+        km = bolig.get("nearest_school_km")
+        if km is None or km > AGDER_MAKS_SKOLE_KM:
+            return False
+
     return True
 
 
@@ -619,7 +671,7 @@ def maybe_send_slack_alert(bolig_id, bolig, alert_settings, rente, nedbetaling_a
 🔗 {bolig["url"]}
 """.strip()
 
-    ok, msg = send_slack_message(text)
+    ok, msg = send_slack_message(text, velg_slack_webhook(bolig["by"]))
 
     if ok:
         nye_alerted_rules = (alerted_rules + "," + alert_key).strip(",")
@@ -754,7 +806,10 @@ def get_email_body(payload):
     return ""
 
 
-def hent_finn_lenker_fra_gmail(max_results=100):
+def hent_finn_lenker_fra_gmail(max_results=100, return_stats=False):
+    """return_stats=True gir (links, antall_meldinger) i stedet for bare
+    links - kun brukt av scan-loggingen i kjor_gmail_boligscan, endrer ikke
+    standardoppforselen for eksisterende kallere."""
     service = get_gmail_service()
 
     results = service.users().messages().list(
@@ -782,6 +837,9 @@ def hent_finn_lenker_fra_gmail(max_results=100):
 
             if link not in links:
                 links.append(link)
+
+    if return_stats:
+        return links, len(messages)
 
     return links
 
@@ -852,12 +910,22 @@ def kjor_gmail_boligscan(alert_settings, rente, nedbetaling_ar, ek_prosent, bruk
     kopier av samme logikk. Kaster aldri unntak videre - enkeltlenker som
     feiler telles bare som "feilet" og resten fortsetter.
     """
-    links = hent_finn_lenker_fra_gmail(max_results=max_results)
+    rader_for = c.execute("SELECT COUNT(*) FROM boliger").fetchone()[0]
+    logger.info("[SCAN START] boliger.db har %d rad(er) for scan starter.", rader_for)
+
+    links, gmail_alerts_funnet = hent_finn_lenker_fra_gmail(max_results=max_results, return_stats=True)
 
     nye = 0
     allerede = 0
     feilet = 0
     varslet = 0
+    hentet = 0
+    avvist = 0
+    slack_agder = 0
+    slack_default = 0
+    slack_feil = 0
+
+    agder_webhook = get_slack_webhook_agder()
 
     for link in links:
         if url_exists(link):
@@ -866,6 +934,7 @@ def kjor_gmail_boligscan(alert_settings, rente, nedbetaling_ar, ek_prosent, bruk
 
         try:
             data = scrape_finn(link)
+            hentet += 1
             lagret, bolig_id = lagre_bolig(data)
 
             if lagret:
@@ -884,13 +953,64 @@ def kjor_gmail_boligscan(alert_settings, rente, nedbetaling_ar, ek_prosent, bruk
 
                 if ok:
                     varslet += 1
+                    valgt_webhook = velg_slack_webhook(data["by"])
+                    if agder_webhook and valgt_webhook == agder_webhook:
+                        slack_agder += 1
+                    else:
+                        slack_default += 1
+                elif msg == "Matcher ikke filter":
+                    avvist += 1
+                elif msg not in ("Slack-varsling er av", "Allerede varslet for dette filteret"):
+                    slack_feil += 1
             else:
                 allerede += 1
 
         except Exception:
             feilet += 1
 
-    return {"nye": nye, "allerede": allerede, "feilet": feilet, "varslet": varslet}
+    rader_etter = c.execute("SELECT COUNT(*) FROM boliger").fetchone()[0]
+
+    logger.info(
+        "[SCAN SUMMARY]\n"
+        "Database rows before scan: %d\n"
+        "Gmail alerts found: %d\n"
+        "FINN URLs found: %d\n"
+        "Listings fetched: %d\n"
+        "New database rows: %d\n"
+        "Duplicates skipped: %d\n"
+        "Slack AGDER: %d\n"
+        "Slack DEFAULT: %d\n"
+        "Rejected: %d\n"
+        "Errors: %d\n"
+        "Database rows after scan: %d",
+        rader_for,
+        gmail_alerts_funnet,
+        len(links),
+        hentet,
+        nye,
+        allerede,
+        slack_agder,
+        slack_default,
+        avvist,
+        feilet + slack_feil,
+        rader_etter,
+    )
+
+    return {
+        "nye": nye,
+        "allerede": allerede,
+        "feilet": feilet,
+        "varslet": varslet,
+        "gmail_alerts": gmail_alerts_funnet,
+        "finn_urls": len(links),
+        "hentet": hentet,
+        "avvist": avvist,
+        "slack_agder": slack_agder,
+        "slack_default": slack_default,
+        "slack_feil": slack_feil,
+        "rader_for": rader_for,
+        "rader_etter": rader_etter,
+    }
 
 
 # Standardverdier for den AUTOMATISKE daglige scanen (worker.py). Ingen bruker
@@ -916,8 +1036,12 @@ DAGLIG_SCAN_DEFAULT_SLACK_ALERTS_ON = True
 
 def logg_boligscan(kilde, resultat, error_message=None):
     c.execute("""
-    INSERT INTO scan_log (kilde, nye, allerede, feilet, varslet, error_message)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO scan_log (
+        kilde, nye, allerede, feilet, varslet, error_message,
+        gmail_alerts, finn_urls, hentet, avvist, slack_agder, slack_default, slack_feil,
+        rader_for, rader_etter
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         kilde,
         resultat.get("nye") if resultat else None,
@@ -925,8 +1049,41 @@ def logg_boligscan(kilde, resultat, error_message=None):
         resultat.get("feilet") if resultat else None,
         resultat.get("varslet") if resultat else None,
         error_message,
+        resultat.get("gmail_alerts") if resultat else None,
+        resultat.get("finn_urls") if resultat else None,
+        resultat.get("hentet") if resultat else None,
+        resultat.get("avvist") if resultat else None,
+        resultat.get("slack_agder") if resultat else None,
+        resultat.get("slack_default") if resultat else None,
+        resultat.get("slack_feil") if resultat else None,
+        resultat.get("rader_for") if resultat else None,
+        resultat.get("rader_etter") if resultat else None,
     ))
     conn.commit()
+
+
+def siste_scan_sammendrag():
+    """Henter siste scan_log-rad (uansett kilde - manuell, planlagt-via-knapp
+    eller den automatiske Docker-workeren) som en dict, slik at UI-et kan vise
+    siste scan-sammendrag selv etter en sideoppdatering (leses direkte fra
+    boliger.db, ikke fra Streamlit sin session_state)."""
+    row = c.execute("""
+    SELECT kilde, nye, allerede, feilet, varslet, error_message,
+           gmail_alerts, finn_urls, hentet, avvist, slack_agder, slack_default, slack_feil,
+           rader_for, rader_etter, run_at
+    FROM scan_log
+    ORDER BY id DESC LIMIT 1
+    """).fetchone()
+
+    if not row:
+        return None
+
+    kolonner = [
+        "kilde", "nye", "allerede", "feilet", "varslet", "error_message",
+        "gmail_alerts", "finn_urls", "hentet", "avvist", "slack_agder", "slack_default", "slack_feil",
+        "rader_for", "rader_etter", "run_at",
+    ]
+    return dict(zip(kolonner, row))
 
 
 def siste_boligscan_dato():
@@ -982,5 +1139,6 @@ def kjor_planlagt_boligscan():
         logg_boligscan("scheduled", resultat)
         return resultat
     except Exception as e:
+        logger.error("[SCAN FAILED] Den planlagte scanen feilet for den rakk a lage et sammendrag: %s", e)
         logg_boligscan("scheduled", None, error_message=str(e))
         return None

@@ -36,10 +36,11 @@ from boligscan_core import (
     hent_finn_lenker_fra_gmail,
     url_exists,
     log_event,
-    lagre_bolig,
     kjor_gmail_boligscan,
+    kjor_planlagt_boligscan,
     logg_boligscan,
     siste_boligscan_dato,
+    siste_scan_sammendrag,
 )
 from salgsoppgave_downloader import (
     hent_salgsoppgave,
@@ -996,43 +997,70 @@ if st.button("Hent nye FINN-varsler fra Gmail"):
         st.error(f"Gmail-feil: {e}")
 
 
-st.subheader("Manuell FINN URL")
+st.divider()
+st.subheader("Kjør den planlagte produksjonscanen manuelt")
+st.caption(
+    "Kaller kjor_planlagt_boligscan() direkte - nøyaktig samme funksjon og "
+    "faste standardverdier som Docker-workeren (worker.py) kjører automatisk "
+    "hver morgen kl. 08:00. Ingen egen kodesti - bruk denne til å teste/"
+    "feilsøke uten å vente til neste planlagte kjøring. Endrer ikke "
+    "sidebar-innstillingene over."
+)
 
-url = st.text_input("FINN URL")
+if st.button("Kjør planlagt scan nå"):
+    with st.spinner("Kjører produksjonscanen..."):
+        resultat = kjor_planlagt_boligscan()
 
-if st.button("Hent fra FINN"):
-    data = scrape_finn(url)
+    if resultat is None:
+        st.error("Scanen feilet - se sammendraget under for feilmeldingen.")
+    else:
+        st.success("Scan fullført.")
 
-    st.session_state["ny_url"] = data["url"]
-    st.session_state["ny_adresse"] = data["adresse"]
-    st.session_state["ny_postnummer"] = data["postnummer"]
-    st.session_state["ny_by"] = data["by"]
-    st.session_state["ny_pris"] = data["pris"]
-    st.session_state["ny_felleskost"] = data["felleskost"]
-    st.session_state["ny_soverom"] = data["soverom"]
-    st.session_state["ny_leie"] = data["leie"]
-    st.session_state["ny_strom"] = data["strom"]
-    st.session_state["ny_kommunale"] = data["kommunale"]
-    st.session_state["ny_andre"] = data["andre"]
-    st.session_state["ny_image_url"] = data["image_url"]
-    st.session_state["ny_eieform"] = data["eieform"]
-    st.session_state["ny_solgt"] = bool(data["solgt"])
-    st.session_state["ny_broker_name"] = data.get("broker_name")
-    st.session_state["ny_broker_office"] = data.get("broker_office")
-    st.session_state["ny_broker_profile_url"] = data.get("broker_profile_url")
-    st.session_state["ny_broker_source_domain"] = data.get("broker_source_domain")
 
-    st.rerun()
+def _vis_scan_sammendrag(sammendrag):
+    if not sammendrag:
+        st.info("Ingen scan er kjørt ennå.")
+        return
+
+    st.caption(f"Siste scan: {sammendrag['run_at']} (kilde: {sammendrag['kilde']})")
+
+    if sammendrag.get("error_message"):
+        st.error(f"Scanen feilet: {sammendrag['error_message']}")
+        return
+
+    rad1 = st.columns(4)
+    rad1[0].metric("Gmail alerts found", sammendrag.get("gmail_alerts"))
+    rad1[1].metric("FINN URLs extracted", sammendrag.get("finn_urls"))
+    rad1[2].metric("Listings fetched", sammendrag.get("hentet"))
+    rad1[3].metric("New listings inserted", sammendrag.get("nye"))
+
+    rad2 = st.columns(4)
+    rad2[0].metric("Duplicates skipped", sammendrag.get("allerede"))
+    rad2[1].metric("Passed Slack filters", sammendrag.get("varslet"))
+    rad2[2].metric("Sent to AGDER", sammendrag.get("slack_agder"))
+    rad2[3].metric("Sent to DEFAULT", sammendrag.get("slack_default"))
+
+    rad3 = st.columns(2)
+    rad3[0].metric("Rejected", sammendrag.get("avvist"))
+    rad3[1].metric("Errors", (sammendrag.get("feilet") or 0) + (sammendrag.get("slack_feil") or 0))
+
+    st.caption(
+        f"Database rows before/after: {sammendrag.get('rader_for')} → {sammendrag.get('rader_etter')}"
+    )
+
+
+st.markdown("**Siste scan-sammendrag**")
+_vis_scan_sammendrag(siste_scan_sammendrag())
+
+
+st.subheader("Hent salgsoppgave")
+
+salgsoppgave_url = st.text_input("FINN URL", key="salgsoppgave_url")
 
 st.caption(f"PDF-er lagres i mappen: `{os.path.join('data', 'salgsoppgaver')}/`")
 
 if st.button("Hent salgsoppgave"):
-    result, _debug_info = hent_salgsoppgave_med_broker_fallback(
-        url,
-        adresse=st.session_state.get("ny_adresse", ""),
-        postnummer=st.session_state.get("ny_postnummer", ""),
-        by=st.session_state.get("ny_by", ""),
-    )
+    result, _debug_info = hent_salgsoppgave_med_broker_fallback(salgsoppgave_url)
     lagre_salgsoppgave_forsok(result)
 
     if is_downloaded_status(result.status):
@@ -1700,105 +1728,6 @@ if st.button("Oppdater dashboard-database", key="dashboard_sync_run"):
     if sammendrag["error_details"]:
         st.error("Noen boliger feilet under synkronisering:")
         st.dataframe(pd.DataFrame(sammendrag["error_details"]), use_container_width=True)
-
-
-data = {
-    "url": st.session_state.get("ny_url", url),
-    "adresse": st.session_state.get("ny_adresse", ""),
-    "postnummer": st.session_state.get("ny_postnummer", ""),
-    "by": st.session_state.get("ny_by", ""),
-    "pris": st.session_state.get("ny_pris", 0),
-    "felleskost": st.session_state.get("ny_felleskost", 0),
-    "soverom": st.session_state.get("ny_soverom", 0),
-    "leie": st.session_state.get("ny_leie", 0),
-    "strom": st.session_state.get("ny_strom", 1500),
-    "kommunale": st.session_state.get("ny_kommunale", 1000),
-    "andre": st.session_state.get("ny_andre", 0),
-    "image_url": st.session_state.get("ny_image_url", ""),
-    "eieform": st.session_state.get("ny_eieform", "Ukjent"),
-    "solgt": st.session_state.get("ny_solgt", 0),
-    "broker_name": st.session_state.get("ny_broker_name"),
-    "broker_office": st.session_state.get("ny_broker_office"),
-    "broker_profile_url": st.session_state.get("ny_broker_profile_url"),
-    "broker_source_domain": st.session_state.get("ny_broker_source_domain"),
-}
-
-if data["image_url"]:
-    st.image(data["image_url"])
-
-st.subheader("Ny bolig / hentet bolig")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    adresse = st.text_input("Adresse", data["adresse"], key="ny_adresse")
-    postnummer = st.text_input("Postnummer", data["postnummer"], key="ny_postnummer")
-    by = st.text_input("By", data["by"], key="ny_by")
-    pris = st.number_input("Pris", value=data["pris"], step=10000, key="ny_pris")
-    felleskost = st.number_input("Felleskost", value=data["felleskost"], step=500, key="ny_felleskost")
-    eieform = st.selectbox("Eieform", ["Ukjent", "Selveier", "Andel"], index=["Ukjent", "Selveier", "Andel"].index(data.get("eieform", "Ukjent")), key="ny_eieform")
-    solgt = st.checkbox("Solgt", value=bool(data.get("solgt", 0)), key="ny_solgt")
-
-with col2:
-    soverom = st.number_input("Soverom", value=data["soverom"], key="ny_soverom")
-    leie = st.number_input("Leie", value=data["leie"], step=500, key="ny_leie")
-    strom = st.number_input("Strøm", value=data["strom"], step=500, key="ny_strom")
-    kommunale = st.number_input("Kommunale", value=data["kommunale"], step=500, key="ny_kommunale")
-    andre = st.number_input("Andre", value=data["andre"], step=500, key="ny_andre")
-
-vis_analyse(pris, felleskost, leie, strom, kommunale, andre, eieform, rente, nedbetaling_ar, ek_prosent, bruk_makslaan, maks_laan)
-
-if st.button("Lagre ny bolig"):
-    ny_data = {
-        "url": data["url"] or url,
-        "adresse": adresse,
-        "postnummer": postnummer,
-        "by": by,
-        "pris": pris,
-        "felleskost": felleskost,
-        "soverom": soverom,
-        "leie": leie,
-        "strom": strom,
-        "kommunale": kommunale,
-        "andre": andre,
-        "image_url": data["image_url"],
-        "eieform": eieform,
-        "solgt": 1 if solgt else 0,
-        "broker_name": data.get("broker_name"),
-        "broker_office": data.get("broker_office"),
-        "broker_profile_url": data.get("broker_profile_url"),
-        "broker_source_domain": data.get("broker_source_domain"),
-    }
-
-    lagret, bolig_id = lagre_bolig(ny_data)
-
-    if lagret:
-        row = c.execute("""
-        SELECT lat, lon, nearest_school, nearest_school_km, nearest_school_min
-        FROM boliger WHERE id=?
-        """, (bolig_id,)).fetchone()
-
-        ny_data["lat"], ny_data["lon"], ny_data["nearest_school"], ny_data["nearest_school_km"], ny_data["nearest_school_min"] = row
-
-        st.success("Lagret!")
-
-        ok, msg = maybe_send_slack_alert(
-            bolig_id,
-            ny_data,
-            alert_settings,
-            rente,
-            nedbetaling_ar,
-            ek_prosent,
-            bruk_makslaan,
-            maks_laan
-        )
-
-        if ok:
-            st.success("Slack-varsel sendt.")
-        else:
-            st.info(f"Ingen Slack-varsel: {msg}")
-    else:
-        st.info("Denne boligen er allerede lagret.")
 
 
 st.divider()
