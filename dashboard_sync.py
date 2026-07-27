@@ -75,6 +75,17 @@ MANAGED_COLUMNS = [
 
 MANAGED_COLUMN_NAMES = [navn for navn, _ in MANAGED_COLUMNS]
 
+# Hendelsestyper fra BoligScanner sin event_log som denne modulen synker inn
+# i dashboard-databasens egen event_log-tabell, til bruk for
+# aktivitetstidslinjen på hver bolig-detaljside i Dashboard-prosjektet:
+#   - bolig_lagret     -> "Boligen ble oppdaget" (finnes fra for)
+#   - gmail_mottatt     -> "E-post mottatt" (faktisk Gmail-mottakstidspunkt)
+#   - slack_varsel      -> "Slack-varsel sendt" (faktisk sendetidspunkt)
+#   - solgt_oppdatert   -> "Markert som solgt" (finnes fra for)
+# Utvid denne listen for a synke flere hendelsestyper - resten av modulen
+# tilpasser seg automatisk.
+TRACKED_EVENT_TYPES = ["bolig_lagret", "gmail_mottatt", "slack_varsel", "solgt_oppdatert"]
+
 
 # ---------------- KONFIGURASJON ----------------
 
@@ -142,6 +153,20 @@ def ensure_schema(dashboard_db_path: str) -> None:
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
+        # event_log for aktivitetstidslinjen (se TRACKED_EVENT_TYPES over).
+        # bolig_id peker her pa dashboard-databasens EGEN boliger.id (satt av
+        # _synk_hendelser etter at raden er matchet/opprettet der) - IKKE den
+        # samme id-en som i BoligScanner sin kildedatabase.
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS event_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bolig_id INTEGER,
+            event_type TEXT,
+            created_at TEXT
+        )
+        """)
+        conn.commit()
     finally:
         conn.close()
 
@@ -215,6 +240,27 @@ def _oppdater_rad(c, rad_id: int, payload: dict) -> None:
     SET {set_klausul}, last_synced_at = ?
     WHERE id = ?
     """, verdier + [_now_iso(), rad_id])
+
+
+def _synk_hendelser(c, dashboard_bolig_id: int, hendelser: List[dict]) -> None:
+    """Overskriver denne boligens TRACKED_EVENT_TYPES-hendelser i dashboard-
+    databasens event_log med det som faktisk finnes i BoligScanner sin
+    event_log akkurat na (samme "kilden til sannhet overskriver"-prinsipp som
+    _oppdater_rad bruker for MANAGED_COLUMNS) - fjerner dermed ikke andre,
+    usporede hendelsestyper som matte finnes fra en eldre full db-kopi."""
+    relevante = [h for h in hendelser if h.get("event_type") in TRACKED_EVENT_TYPES]
+
+    plassholdere = ", ".join("?" for _ in TRACKED_EVENT_TYPES)
+    c.execute(
+        f"DELETE FROM event_log WHERE bolig_id = ? AND event_type IN ({plassholdere})",
+        [dashboard_bolig_id] + TRACKED_EVENT_TYPES,
+    )
+
+    for h in relevante:
+        c.execute(
+            "INSERT INTO event_log (bolig_id, event_type, created_at) VALUES (?, ?, ?)",
+            (dashboard_bolig_id, h["event_type"], h.get("created_at")),
+        )
 
 
 def _kopier_dokument_hvis_konfigurert(
@@ -315,10 +361,12 @@ def sync_boliger(
                 if eksisterende_id:
                     if not dry_run:
                         _oppdater_rad(c, eksisterende_id, payload)
+                        _synk_hendelser(c, eksisterende_id, rec.get("_events") or [])
                     sammendrag["updated"] += 1
                 else:
                     if not dry_run:
                         _sett_inn_rad(c, payload)
+                        _synk_hendelser(c, c.lastrowid, rec.get("_events") or [])
                     sammendrag["inserted"] += 1
 
             except Exception as e:

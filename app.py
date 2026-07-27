@@ -1588,7 +1588,7 @@ def bygg_dashboard_synk_poster(rente, nedbetaling_ar, ek_prosent, bruk_makslaan,
     finansieringsforutsetningene som er satt i sidebaren akkurat nå, slik at
     Dashboard-prosjektet slipper å implementere egen finansieringslogikk."""
     rows = c.execute("""
-    SELECT url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre,
+    SELECT id, url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre,
            image_url, eieform, solgt,
            broker_name, broker_office, broker_profile_url, broker_source_domain, broker_listing_url,
            salgsoppgave_status, salgsoppgave_local_path, salgsoppgave_document_url,
@@ -1598,11 +1598,23 @@ def bygg_dashboard_synk_poster(rente, nedbetaling_ar, ek_prosent, bruk_makslaan,
     ORDER BY id
     """).fetchall()
 
+    # Alle event_log-hendelser gruppert per bolig_id, i én batch-spørring i
+    # stedet for én per bolig (event_type-filtrering skjer i
+    # dashboard_sync.TRACKED_EVENT_TYPES, ikke her - denne funksjonen sender
+    # bare med det som finnes).
+    hendelser_per_bolig = {}
+    for hendelse_bolig_id, event_type, hendelse_tid in c.execute(
+        "SELECT bolig_id, event_type, created_at FROM event_log WHERE bolig_id IS NOT NULL"
+    ).fetchall():
+        hendelser_per_bolig.setdefault(hendelse_bolig_id, []).append(
+            {"event_type": event_type, "created_at": hendelse_tid}
+        )
+
     poster = []
 
     for row in rows:
         (
-            url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre,
+            bolig_id, url, adresse, postnummer, by, pris, felleskost, soverom, leie, strom, kommunale, andre,
             image_url, eieform, solgt,
             broker_name, broker_office, broker_profile_url, broker_source_domain, broker_listing_url,
             salgsoppgave_status, salgsoppgave_local_path, salgsoppgave_document_url,
@@ -1651,6 +1663,7 @@ def bygg_dashboard_synk_poster(rente, nedbetaling_ar, ek_prosent, bruk_makslaan,
             "tilstandsrapport_local_path": tilstandsrapport_local_path,
             "tilstandsrapport_document_url": tilstandsrapport_document_url,
             "document_analysis_json": document_analysis_json,
+            "_events": hendelser_per_bolig.get(bolig_id, []),
             "image_url": image_url,
             "image_local_path": None,
         })

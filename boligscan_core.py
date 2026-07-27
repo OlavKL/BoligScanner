@@ -28,7 +28,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 import streamlit as st
@@ -806,10 +806,29 @@ def get_email_body(payload):
     return ""
 
 
+def _gmail_internal_date_til_tekst(internal_date_ms):
+    """Konverterer Gmail sitt internalDate-felt (ms siden epoch, UTC - satt av
+    Gmail selv når eposten ble mottatt, ikke av senderen) til samme
+    "YYYY-MM-DD HH:MM:SS"-tekstformat (UTC) som event_log.created_at sin
+    CURRENT_TIMESTAMP-standard bruker, slik at de kan sammenlignes/sorteres
+    likt. Returnerer None hvis feltet mangler eller ikke kan tolkes."""
+    if not internal_date_ms:
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(internal_date_ms) / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def hent_finn_lenker_fra_gmail(max_results=100, return_stats=False):
-    """return_stats=True gir (links, antall_meldinger) i stedet for bare
-    links - kun brukt av scan-loggingen i kjor_gmail_boligscan, endrer ikke
-    standardoppforselen for eksisterende kallere."""
+    """Returnerer en liste med {"url", "gmail_received_at"} - gmail_received_at
+    er Gmail sitt eget mottakstidspunkt for eposten lenken ble funnet i (se
+    _gmail_internal_date_til_tekst), til bruk for "E-post mottatt"-hendelsen i
+    Dashboard-prosjektets aktivitetstidslinje. return_stats=True gir i
+    tillegg (links, antall_meldinger) - kun brukt av scan-loggingen i
+    kjor_gmail_boligscan, endrer ikke standardoppforselen for eksisterende
+    kallere."""
     service = get_gmail_service()
 
     results = service.users().messages().list(
@@ -820,6 +839,7 @@ def hent_finn_lenker_fra_gmail(max_results=100, return_stats=False):
 
     messages = results.get("messages", [])
     links = []
+    sette_urler = set()
 
     for msg in messages:
         message = service.users().messages().get(
@@ -828,6 +848,8 @@ def hent_finn_lenker_fra_gmail(max_results=100, return_stats=False):
             format="full"
         ).execute()
 
+        mottatt_tidspunkt = _gmail_internal_date_til_tekst(message.get("internalDate"))
+
         body = get_email_body(message["payload"])
         found = re.findall(r"https://www\.finn\.no/\d+[^\s\"<>]*", body)
 
@@ -835,8 +857,9 @@ def hent_finn_lenker_fra_gmail(max_results=100, return_stats=False):
             link = link.replace("&amp;", "&")
             link = link.split("?")[0]
 
-            if link not in links:
-                links.append(link)
+            if link not in sette_urler:
+                sette_urler.add(link)
+                links.append({"url": link, "gmail_received_at": mottatt_tidspunkt})
 
     if return_stats:
         return links, len(messages)
@@ -851,11 +874,20 @@ def url_exists(url):
     return c.fetchone() is not None
 
 
-def log_event(event_type, bolig_id=None, bolig_url="", filter_name=""):
-    c.execute("""
-    INSERT INTO event_log (event_type, bolig_id, bolig_url, filter_name)
-    VALUES (?, ?, ?, ?)
-    """, (event_type, bolig_id, bolig_url, filter_name))
+def log_event(event_type, bolig_id=None, bolig_url="", filter_name="", created_at=None):
+    """created_at lar kalleren stemple hendelsen med et tidspunkt i fortiden
+    (f.eks. når en Gmail-epost faktisk ble mottatt) i stedet for "na" -
+    utelates den brukes tabellens CURRENT_TIMESTAMP-standard som for."""
+    if created_at:
+        c.execute("""
+        INSERT INTO event_log (event_type, bolig_id, bolig_url, filter_name, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """, (event_type, bolig_id, bolig_url, filter_name, created_at))
+    else:
+        c.execute("""
+        INSERT INTO event_log (event_type, bolig_id, bolig_url, filter_name)
+        VALUES (?, ?, ?, ?)
+        """, (event_type, bolig_id, bolig_url, filter_name))
     conn.commit()
 
 
@@ -927,7 +959,10 @@ def kjor_gmail_boligscan(alert_settings, rente, nedbetaling_ar, ek_prosent, bruk
 
     agder_webhook = get_slack_webhook_agder()
 
-    for link in links:
+    for link_info in links:
+        link = link_info["url"]
+        gmail_received_at = link_info["gmail_received_at"]
+
         if url_exists(link):
             allerede += 1
             continue
@@ -939,6 +974,9 @@ def kjor_gmail_boligscan(alert_settings, rente, nedbetaling_ar, ek_prosent, bruk
 
             if lagret:
                 nye += 1
+
+                if gmail_received_at:
+                    log_event("gmail_mottatt", bolig_id, data["url"], "", created_at=gmail_received_at)
 
                 row = c.execute("""
                 SELECT lat, lon, nearest_school, nearest_school_km, nearest_school_min
