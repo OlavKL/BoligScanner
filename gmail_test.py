@@ -1,3 +1,28 @@
+"""(Re)autentiser Gmail-integrasjonen - MÅ kjøres PÅ VERTEN, IKKE inne i
+Docker.
+
+get_gmail_service() i boligscan_core.py (brukt av både boligscanner-UI-et og
+boligscanner-worker) gjør bevisst aldri en interaktiv nettleser-innlogging,
+fordi begge de containerne kjører headless: ingen nettleser, og den
+tilfeldige lokale porten InstalledAppFlow.run_local_server() under lytter på
+er ikke videresendt ut av containeren (kun 8501 er det, se
+docker-compose.yml). Dette skriptet gjør selve den interaktive flyten - kjør
+det direkte på Windows-verten, i en vanlig terminal (ikke via `docker exec`),
+der en ekte nettleser finnes:
+
+    python gmail_test.py
+
+Prosjektmappen er volum-montert inn i begge containerne (`.:/app` i
+docker-compose.yml), så det nye token.json plukkes opp umiddelbart av dem -
+ingen restart nødvendig.
+
+Hvis dette må gjøres ofte (typisk hver 7. dag med feilen "invalid_grant:
+Token has been expired or revoked."), skyldes det at Google Cloud-prosjektet
+fortsatt står i "Testing"-status i OAuth-samtykkeskjermen, der Google lar
+refresh-tokens utløpe etter 7 dager uansett bruk. Publiser samtykkeskjermen
+til "In production" i Google Cloud Console for å slippe dette.
+"""
+
 import os.path
 import base64
 import re

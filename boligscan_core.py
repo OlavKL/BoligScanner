@@ -24,6 +24,7 @@ på egen hånd.
 """
 
 import base64
+import json
 import logging
 import os
 import re
@@ -34,11 +35,33 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from salgsoppgave_downloader import extract_broker_info
+from salgsoppgave_downloader import (
+    extract_broker_info,
+    extract_finn_ad_id,
+    hent_salgsoppgave,
+    is_downloaded_status,
+    DOWNLOADED_STATUSES,
+    STATUS_LINK_FOUND_NOT_PDF,
+    STATUS_INVALID_PDF_RESPONSE,
+    STATUS_LISTING_SOLD_OR_INACTIVE,
+    STATUS_DOWNLOADED_VALID_PDF,
+    get_default_headers,
+    REQUEST_TIMEOUT,
+)
+from broker_site_fallback import find_and_download_from_broker_site
+from broker_document_parser import (
+    download_broker_documents,
+    velg_primaert_dokument,
+    er_megler_side_solgt_eller_inaktiv,
+    PRIMARY_DOCUMENT_TYPES,
+    CONDITION_REPORT_DOCUMENT_TYPES,
+)
+from document_parser import analyze_salgsoppgave_pdf, COMPONENT_ORDER, COMPONENT_DISPLAY_NAVN
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
@@ -610,6 +633,82 @@ def bolig_matcher_alert(bolig, yield_pct, netto_etter_lan, alert_settings):
     return True
 
 
+# Tilstandsgrader som faktisk er verdt å nevne i et Slack-varsel - TG0/TG1
+# betyr "ingen/mindre avvik", altså ikke noe å dra frem i et kort utkast.
+_TG_KREVER_OPPMERKSOMHET = {"TG2", "TG3", "TGIU"}
+
+
+def bygg_dokumentfunn_tekst(analyse):
+    """Bygger en kort tekst med KUN de viktigste funnene fra
+    document_parser.py sin analyse av salgsoppgaven: komponenter gradert
+    TG2/TG3/TGIU (ikke TG0/TG1 - de er ikke noe å dra frem), samt eventuelle
+    nøkkelord (fukt, lekkasje, avvik, osv). Dette er bevisst IKKE en full
+    gjengivelse av analysen - bare et lite utkast av det som faktisk peker på
+    noe å følge opp. Returnerer tom streng hvis ingenting slikt ble funnet."""
+    if not analyse:
+        return ""
+
+    linjer = []
+    for komponent in COMPONENT_ORDER:
+        funn = analyse.get(komponent)
+        if not funn or funn.get("tg") not in _TG_KREVER_OPPMERKSOMHET:
+            continue
+        visningsnavn = COMPONENT_DISPLAY_NAVN.get(komponent, komponent)
+        linje = f"• {visningsnavn}: {funn['tg']}"
+        if funn.get("remark"):
+            linje += f" – {funn['remark']}"
+        linjer.append(linje)
+
+    if analyse.get("keywords"):
+        linjer.append("• Nøkkelord: " + ", ".join(analyse["keywords"]))
+
+    if not linjer:
+        return ""
+
+    # Hold varselet kort - resten av analysen kan ses i appen.
+    return "📄 *Viktigste funn i salgsoppgaven:*\n" + "\n".join(linjer[:6])
+
+
+def bygg_dokument_seksjon_for_slack(bolig_id):
+    """Henter salgsoppgave-lenke og dokumentanalyse (hvis
+    hent_salgsoppgave_med_broker_fallback + analyser_og_lagre_dokumentanalyse
+    har kjørt for boligen) og bygger seksjonen som settes inn i
+    Slack-varselet - en klikkbar lenke til salgsoppgaven (Slack-webhooks kan
+    ikke sende ekte filvedlegg) pluss et kort utdrag av dokumentfunnene.
+    Returnerer tom streng hvis ingen salgsoppgave er funnet for boligen."""
+    row = c.execute("""
+    SELECT salgsoppgave_document_url, salgsoppgave_local_path, document_analysis_json
+    FROM boliger WHERE id=?
+    """, (bolig_id,)).fetchone()
+
+    if not row:
+        return ""
+
+    salgsoppgave_url, salgsoppgave_path, analyse_json = row
+
+    deler = []
+
+    if salgsoppgave_url:
+        deler.append(f"📎 *Salgsoppgave:* {salgsoppgave_url}")
+    elif salgsoppgave_path:
+        deler.append("📎 *Salgsoppgave:* funnet og lastet ned, men uten en direkte lenke å dele.")
+
+    if analyse_json:
+        try:
+            analyse = json.loads(analyse_json)
+        except (TypeError, ValueError):
+            analyse = {}
+
+        funn_tekst = bygg_dokumentfunn_tekst(analyse)
+        if funn_tekst:
+            deler.append(funn_tekst)
+
+    if not deler:
+        return ""
+
+    return "\n" + "\n\n".join(deler) + "\n"
+
+
 def maybe_send_slack_alert(bolig_id, bolig, alert_settings, rente, nedbetaling_ar, ek_prosent, bruk_makslaan, maks_laan):
     if not alert_settings["slack_alerts_on"]:
         return False, "Slack-varsling er av"
@@ -650,6 +749,8 @@ def maybe_send_slack_alert(bolig_id, bolig, alert_settings, rente, nedbetaling_a
 
     break_even_leie = bolig["leie"] - netto_etter_lan
 
+    dokument_seksjon = bygg_dokument_seksjon_for_slack(bolig_id)
+
     text = f"""
 🏠 *Ny bolig matcher filteret: {alert_settings["alert_name"]}*
 
@@ -667,7 +768,7 @@ def maybe_send_slack_alert(bolig_id, bolig, alert_settings, rente, nedbetaling_a
 • Tåler renteøkninger: {hopp} x 0,25 %-poeng
 
 🎓 *Nærmeste universitet/skole:* {skole_text}
-
+{dokument_seksjon}
 🔗 {bolig["url"]}
 """.strip()
 
@@ -773,18 +874,49 @@ def scrape_finn(url):
 # ---------------- GMAIL ----------------
 
 def get_gmail_service():
-    creds = None
+    """Krever at token.json allerede finnes og har en gyldig refresh_token.
+    Gjør bevisst ALDRI en interaktiv nettleser-basert innlogging herfra (i
+    motsetning til tidligere) - boligscanner og boligscanner-worker kjører nå
+    begge inne i Docker-containere uten nettleser og uten at den tilfeldige
+    lokale porten InstalledAppFlow.run_local_server() lytter på er
+    videresendt ut av containeren, så et slikt forsøk kan aldri lykkes der
+    (feiler kun med den kryptiske "could not locate runnable browser").
 
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    Kjør i stedet `python gmail_test.py` PÅ VERTEN (utenfor Docker, i en
+    vanlig terminal med nettleser) for å (re)autentisere - se den filens
+    docstring. Siden prosjektmappen er volum-montert inn i begge containerne
+    (`.:/app` i docker-compose.yml), plukkes det nye token.json opp med en
+    gang, uten restart."""
+    if not os.path.exists("token.json"):
+        raise RuntimeError(
+            "Gmail er ikke autentisert (token.json mangler). Kjør "
+            "`python gmail_test.py` PÅ VERTEN (utenfor Docker) for å "
+            "autentisere - se den filens docstring."
+        )
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+
+    if not creds.valid:
+        if not (creds.expired and creds.refresh_token):
+            raise RuntimeError(
+                "Gmail-tokenet er ugyldig og har ingen refresh_token å "
+                "fornye med. Kjør `python gmail_test.py` PÅ VERTEN (utenfor "
+                "Docker) for å autentisere på nytt - se den filens docstring."
+            )
+
+        try:
             creds.refresh(Request())
-        else:
-            from google_auth_oauthlib.flow import InstalledAppFlow
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
+        except RefreshError as e:
+            raise RuntimeError(
+                "Gmail-tilgangen er utløpt eller trukket tilbake (vanligvis "
+                "fordi Google Cloud-prosjektet fortsatt står i "
+                "\"Testing\"-status, der refresh-tokens utløper etter 7 "
+                "dager uansett bruk). Kjør `python gmail_test.py` PÅ VERTEN "
+                "(utenfor Docker) for å autentisere på nytt - se den filens "
+                "docstring. For å slippe å gjøre dette hver uke, publiser "
+                "OAuth-samtykkeskjermen i Google Cloud Console til "
+                "\"In production\" i stedet for \"Testing\"."
+            ) from e
 
         with open("token.json", "w") as token:
             token.write(creds.to_json())
@@ -932,6 +1064,432 @@ def lagre_bolig(data):
     return True, ny_bolig_id
 
 
+# ---------------- SALGSOPPGAVE ----------------
+# Flyttet hit fra app.py (var før kun tilgjengelig for de manuelle
+# "Hent salgsoppgave"-knappene) slik at den automatiske scanen
+# (kjor_gmail_boligscan under) også kan hente og analysere salgsoppgaven for
+# hver nye bolig - se maybe_send_slack_alert/bygg_dokument_seksjon_for_slack
+# over for hvordan resultatet havner i Slack-varselet. app.py sine knapper
+# importerer nå disse funksjonene herfra i stedet for å definere dem selv.
+
+def finn_bolig_id_for_finn_annonse(finn_ad_id, finn_url):
+    """Finner id i boliger-tabellen for en FINN-annonse.
+
+    Prøver finn_ad_id først (robust mot at url-varianter/spørrestrenger endrer seg),
+    faller tilbake til eksakt url-match. Brukes for å oppdatere riktig eksisterende
+    rad uten å risikere å opprette duplikater.
+    """
+    if finn_ad_id:
+        alle = c.execute("""
+        SELECT id, url FROM boliger WHERE url IS NOT NULL AND url != ''
+        """).fetchall()
+
+        for rid, rurl in alle:
+            if extract_finn_ad_id(rurl) == finn_ad_id:
+                return rid
+
+    if finn_url:
+        row = c.execute("SELECT id FROM boliger WHERE url = ?", (finn_url,)).fetchone()
+        if row:
+            return row[0]
+
+    return None
+
+
+def oppdater_bolig_broker_og_salgsoppgave(finn_ad_id, finn_url, result):
+    """Oppdaterer megler- og salgsoppgave-felter på den matchende bolig-raden.
+
+    Regraderer aldri: hvis raden allerede har en ekte nedlastet PDF for
+    salgsoppgave og/eller tilstandsrapport fra et tidligere forsøk, og DETTE
+    forsøket bare fant en digital lenke (eller ingenting), beholdes det
+    forrige, bedre resultatet for akkurat det dokumentet uendret. De to
+    dokumenttypene vurderes helt uavhengig av hverandre.
+
+    Returnerer bolig_id hvis en rad ble funnet og oppdatert, ellers None.
+    """
+    bolig_id = finn_bolig_id_for_finn_annonse(finn_ad_id, finn_url)
+
+    if not bolig_id:
+        return None
+
+    eksisterende = c.execute("""
+    SELECT salgsoppgave_status, salgsoppgave_local_path, salgsoppgave_document_url,
+           tilstandsrapport_download_status, tilstandsrapport_local_path, tilstandsrapport_document_url
+    FROM boliger WHERE id = ?
+    """, (bolig_id,)).fetchone()
+
+    (
+        eksisterende_salgsoppgave_status, eksisterende_salgsoppgave_path, eksisterende_salgsoppgave_url,
+        eksisterende_tilstand_status, eksisterende_tilstand_path, eksisterende_tilstand_url,
+    ) = eksisterende if eksisterende else (None, None, None, None, None, None)
+
+    ny_salgsoppgave_status = result.status
+    ny_salgsoppgave_path = result.local_pdf_path
+    ny_salgsoppgave_url = result.found_document_url
+
+    if eksisterende_salgsoppgave_status in DOWNLOADED_STATUSES and ny_salgsoppgave_status not in DOWNLOADED_STATUSES:
+        ny_salgsoppgave_status = eksisterende_salgsoppgave_status
+        ny_salgsoppgave_path = eksisterende_salgsoppgave_path
+        ny_salgsoppgave_url = eksisterende_salgsoppgave_url
+
+    ny_tilstand_status = result.tilstandsrapport_status
+    ny_tilstand_path = result.tilstandsrapport_local_path
+    ny_tilstand_url = result.tilstandsrapport_document_url
+
+    if eksisterende_tilstand_status == STATUS_DOWNLOADED_VALID_PDF and ny_tilstand_status != STATUS_DOWNLOADED_VALID_PDF:
+        ny_tilstand_status = eksisterende_tilstand_status
+        ny_tilstand_path = eksisterende_tilstand_path
+        ny_tilstand_url = eksisterende_tilstand_url
+
+    # Ikke overskriv med en tom liste hvis dette forsøket ikke fant noen nye
+    # dokumenter - da beholdes det som ble lastet ned i et tidligere forsøk.
+    downloaded_documents_json = (
+        json.dumps(result.downloaded_documents, ensure_ascii=False)
+        if result.downloaded_documents else None
+    )
+
+    c.execute("""
+    UPDATE boliger
+    SET broker_name = COALESCE(?, broker_name),
+        broker_office = COALESCE(?, broker_office),
+        broker_profile_url = COALESCE(?, broker_profile_url),
+        broker_source_domain = COALESCE(?, broker_source_domain),
+        broker_listing_url = COALESCE(?, broker_listing_url),
+        salgsoppgave_status = ?,
+        salgsoppgave_local_path = ?,
+        salgsoppgave_document_url = ?,
+        salgsoppgave_download_status = ?,
+        salgsoppgave_source = ?,
+        salgsoppgave_source_detail = ?,
+        tilstandsrapport_local_path = ?,
+        tilstandsrapport_document_url = ?,
+        tilstandsrapport_download_status = ?,
+        downloaded_documents_json = COALESCE(?, downloaded_documents_json)
+    WHERE id = ?
+    """, (
+        result.broker_name,
+        result.broker_office,
+        result.broker_profile_url,
+        result.broker_source_domain,
+        result.broker_listing_url,
+        ny_salgsoppgave_status,
+        ny_salgsoppgave_path,
+        ny_salgsoppgave_url,
+        ny_salgsoppgave_status,
+        result.salgsoppgave_source,
+        result.salgsoppgave_source_detail,
+        ny_tilstand_path,
+        ny_tilstand_url,
+        ny_tilstand_status,
+        downloaded_documents_json,
+        bolig_id,
+    ))
+    conn.commit()
+
+    return bolig_id
+
+
+def analyser_og_lagre_dokumentanalyse(bolig_id, local_pdf_path, force=False):
+    """Kjører document_parser på salgsoppgave-PDF-en og lagrer resultatet som
+    document_analysis_json på bolig-raden.
+
+    Parser aldri samme fil to ganger: hvis document_analysis_source_path
+    allerede peker på nøyaktig denne filstien, hoppes analysen over med
+    mindre force=True er satt eksplisitt (f.eks. fra en "Analyser på nytt"-knapp).
+    """
+    if not local_pdf_path or not os.path.exists(local_pdf_path):
+        return False
+
+    if not force:
+        row = c.execute(
+            "SELECT document_analysis_source_path FROM boliger WHERE id = ?", (bolig_id,)
+        ).fetchone()
+        if row and row[0] == local_pdf_path:
+            return False
+
+    analyse = analyze_salgsoppgave_pdf(local_pdf_path)
+    analyse_json = json.dumps(analyse, ensure_ascii=False) if analyse else None
+
+    c.execute("""
+    UPDATE boliger
+    SET document_analysis_json = ?, document_analysis_source_path = ?
+    WHERE id = ?
+    """, (analyse_json, local_pdf_path, bolig_id))
+    conn.commit()
+
+    return True
+
+
+def _hent_meglerside_trygt(url):
+    """Henter en meglerside med samme høflige innstillinger som resten av
+    modulen. Returnerer None (aldri unntak) ved nettverksfeil/4xx/5xx."""
+    try:
+        resp = requests.get(url, headers=get_default_headers(), timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException:
+        return None
+
+    if resp.status_code >= 400:
+        return None
+
+    return resp
+
+
+def _anvend_broker_dokumenter(result, documents, kilde_beskrivelse):
+    """Fyller inn salgsoppgave-/tilstandsrapport-feltene på result basert på
+    dokumentene funnet på en godtatt meglerside.
+
+    Både salgsoppgave og tilstandsrapport behandles uavhengig av hverandre -
+    en digital/fil-proxy-lenke telles som "funnet" selv uten nedlastet PDF
+    (result.status/tilstandsrapport_status = document_link_found_but_not_direct_pdf),
+    og document_url lagres uansett slik at brukeren kan åpne den manuelt.
+    """
+    salgsoppgave_doc = velg_primaert_dokument(documents, PRIMARY_DOCUMENT_TYPES)
+    tilstand_doc = velg_primaert_dokument(documents, CONDITION_REPORT_DOCUMENT_TYPES)
+
+    result.downloaded_documents = [doc.as_dict() for doc in documents if doc.local_path]
+
+    if tilstand_doc:
+        result.tilstandsrapport_status = tilstand_doc.download_status
+        if tilstand_doc.download_status == STATUS_DOWNLOADED_VALID_PDF:
+            result.tilstandsrapport_local_path = tilstand_doc.local_path
+        else:
+            result.tilstandsrapport_document_url = tilstand_doc.url
+    else:
+        result.tilstandsrapport_status = "document_not_found"
+
+    if salgsoppgave_doc:
+        result.salgsoppgave_source = "broker_site"
+        result.found_document_url = salgsoppgave_doc.url
+
+        if salgsoppgave_doc.download_status == STATUS_DOWNLOADED_VALID_PDF:
+            result.status = "found_from_broker_site"
+            result.local_pdf_path = salgsoppgave_doc.local_path
+            result.salgsoppgave_source_detail = f"Salgsoppgave lastet ned {kilde_beskrivelse}."
+        elif salgsoppgave_doc.download_status == STATUS_LINK_FOUND_NOT_PDF:
+            result.status = STATUS_LINK_FOUND_NOT_PDF
+            result.salgsoppgave_source_detail = (
+                f"Salgsoppgave funnet {kilde_beskrivelse}, men må åpnes som digital salgsoppgave "
+                "(ikke en direkte PDF-fil)."
+            )
+        else:
+            result.status = STATUS_INVALID_PDF_RESPONSE
+            result.salgsoppgave_source_detail = (
+                f"Fant en dokumentlenke {kilde_beskrivelse}, men innholdet så ikke ut som en gyldig PDF."
+            )
+    else:
+        result.status = "not_found"
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            f"Ingen salgsoppgave/prospekt funnet {kilde_beskrivelse}."
+            + (" Fant derimot en tilstandsrapport/takst." if tilstand_doc else "")
+        )
+
+
+def hent_salgsoppgave_med_broker_fallback(finn_url, adresse="", postnummer="", by=""):
+    """Prøver FINN-annonsen først (hent_salgsoppgave). Hvis salgsoppgave ikke ble
+    funnet der og annonsen fortsatt er aktiv, følges denne foretrukne rekkefølgen:
+
+    1. FINN-PDF direkte (hent_salgsoppgave).
+    2. Hvis FINN-annonsen har en direkte lenke til meglerens boligside (typisk
+       knappen "Se komplett salgsoppgave"), følges DEN lenken. Den garanterer at
+       vi havner på riktig eiendom, så broker_listing_url lagres med en gang -
+       selv om dokumentsøket på meglersiden ikke gir noen nedlastbar fil.
+    3. KUN hvis FINN-annonsen ikke har en slik direktelenke, brukes den eldre
+       adressesøk-fallbacken (broker_site_fallback) som prøver å gjette seg
+       frem til riktig bolig hos megleren.
+
+    Et funnet dokument som viser seg å være en digital salgsoppgave/fil-proxy
+    (typisk Aktiv) telles som FUNNET (status=document_link_found_but_not_direct_pdf),
+    ikke som en feil - se broker_document_parser.py.
+
+    Returnerer (result, debug_info). debug_info er en dict med detaljer om
+    FINN-forsøket og megler-søket - brukes av "Test broker fallback"-seksjonen
+    for feilsøking/tuning, men er fritt å ignorere for andre kallere.
+    """
+    result = hent_salgsoppgave(finn_url)
+
+    debug_info = {
+        "finn_status": result.status,
+        "finn_listing_active": result.finn_listing_active,
+        "finn_source_detail": result.salgsoppgave_source_detail,
+        "broker_property_link": result.broker_property_link,
+        "broker_link_strategy": None,  # "direct_link" | "address_search" | None
+        "broker_attempted": False,
+        "broker_search_urls_attempted": [],
+        "broker_candidate_urls": [],
+        "broker_candidate_evaluations": [],
+        "broker_doc_links_found": [],
+        "broker_skip_reason": None,
+    }
+
+    if is_downloaded_status(result.status):
+        return result, debug_info
+
+    if result.status == "error":
+        return result, debug_info
+
+    # result.status == "not_found" herfra - vurder megler-fallback.
+    if not result.finn_listing_active:
+        debug_info["broker_skip_reason"] = "Annonsen er ikke aktiv (solgt/avsluttet)."
+        result.status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.tilstandsrapport_status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            (result.salgsoppgave_source_detail + " " if result.salgsoppgave_source_detail else "")
+            + "Annonsen er ikke aktiv (solgt/avsluttet) - hopper over megler-søk."
+        ).strip()
+        return result, debug_info
+
+    # --- Steg 2: direkte lenke via "Se komplett salgsoppgave" (foretrukket) ---
+    if result.broker_property_link:
+        debug_info["broker_attempted"] = True
+        debug_info["broker_link_strategy"] = "direct_link"
+
+        # Lagres med en gang - selv om siden under skulle vise seg å ikke gi
+        # noen nedlastbare dokumenter.
+        result.broker_listing_url = result.broker_property_link
+
+        broker_page = _hent_meglerside_trygt(result.broker_property_link)
+
+        if broker_page is None:
+            result.salgsoppgave_source = "not_found"
+            result.salgsoppgave_source_detail = (
+                f"Fant direktelenke til megler ({result.broker_property_link}), "
+                "men klarte ikke å hente meglersiden."
+            )
+            return result, debug_info
+
+        if er_megler_side_solgt_eller_inaktiv(broker_page.text):
+            result.status = STATUS_LISTING_SOLD_OR_INACTIVE
+            result.tilstandsrapport_status = STATUS_LISTING_SOLD_OR_INACTIVE
+            result.salgsoppgave_source = "not_found"
+            result.salgsoppgave_source_detail = (
+                f"Meglersiden ({result.broker_property_link}) indikerer at boligen er solgt/ikke lenger aktiv."
+            )
+            return result, debug_info
+
+        documents = download_broker_documents(
+            broker_page.text, result.broker_property_link, finn_ad_id=result.finn_ad_id
+        )
+        debug_info["broker_doc_links_found"] = [
+            {"type": doc.doc_type, "url": doc.url, "text": doc.text, "download_status": doc.download_status}
+            for doc in documents
+        ]
+
+        _anvend_broker_dokumenter(
+            result, documents, f"via direktelenke fra FINN ('Se komplett salgsoppgave') til {result.broker_property_link}"
+        )
+
+        # Viktig: siden direktelenken fantes, skal IKKE adressesøk-fallbacken
+        # forsøkes i tillegg (se punkt 7 i kravspesifikasjonen).
+        return result, debug_info
+
+    # --- Steg 3: adressesøk-fallback (kun når direktelenken mangler) ---
+    debug_info["broker_link_strategy"] = "address_search"
+
+    if not result.broker_source_domain:
+        debug_info["broker_skip_reason"] = "Ingen kjent meglerdomene oppdaget på FINN-annonsen."
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            (result.salgsoppgave_source_detail + " " if result.salgsoppgave_source_detail else "")
+            + "Ingen kjent meglerdomene oppdaget - hopper over megler-søk."
+        ).strip()
+        return result, debug_info
+
+    if not adresse:
+        debug_info["broker_skip_reason"] = "Mangler adresse for boligen."
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = (
+            (result.salgsoppgave_source_detail + " " if result.salgsoppgave_source_detail else "")
+            + "Mangler adresse for boligen - kan ikke søke hos megler."
+        ).strip()
+        return result, debug_info
+
+    debug_info["broker_attempted"] = True
+
+    try:
+        broker_result = find_and_download_from_broker_site(
+            broker_domain=result.broker_source_domain,
+            adresse=adresse,
+            postnummer=postnummer,
+            by=by,
+            finn_ad_id=result.finn_ad_id,
+        )
+    except Exception as e:
+        debug_info["broker_skip_reason"] = f"Megler-søk feilet uventet: {e}"
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = f"Megler-søk feilet uventet: {e}"
+        return result, debug_info
+
+    debug_info["broker_search_urls_attempted"] = broker_result.search_urls_attempted
+    debug_info["broker_candidate_urls"] = broker_result.candidate_urls
+    debug_info["broker_candidate_evaluations"] = broker_result.candidate_evaluations
+    debug_info["broker_doc_links_found"] = broker_result.doc_links_found
+
+    if broker_result.listing_url:
+        result.broker_listing_url = broker_result.listing_url
+
+    if broker_result.listing_sold_or_inactive:
+        result.status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.tilstandsrapport_status = STATUS_LISTING_SOLD_OR_INACTIVE
+        result.salgsoppgave_source = "not_found"
+        result.salgsoppgave_source_detail = broker_result.match_detail
+        return result, debug_info
+
+    _anvend_broker_dokumenter(result, broker_result.documents, "hos megler (adressesøk)")
+
+    return result, debug_info
+
+
+def lagre_salgsoppgave_forsok(result):
+    downloaded_documents_json = json.dumps(result.downloaded_documents, ensure_ascii=False)
+
+    c.execute("""
+    INSERT INTO salgsoppgave_forsok (
+        finn_url, finn_ad_id, found_document_url, local_pdf_path,
+        status, attempted_at, error_message,
+        broker_name, broker_office, broker_profile_url, broker_source_domain,
+        broker_listing_url, salgsoppgave_source, salgsoppgave_source_detail,
+        tilstandsrapport_local_path, downloaded_documents_json,
+        salgsoppgave_document_url, tilstandsrapport_document_url,
+        salgsoppgave_download_status, tilstandsrapport_download_status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        result.finn_url,
+        result.finn_ad_id,
+        result.found_document_url,
+        result.local_pdf_path,
+        result.status,
+        result.attempted_at,
+        result.error_message,
+        result.broker_name,
+        result.broker_office,
+        result.broker_profile_url,
+        result.broker_source_domain,
+        result.broker_listing_url,
+        result.salgsoppgave_source,
+        result.salgsoppgave_source_detail,
+        result.tilstandsrapport_local_path,
+        downloaded_documents_json,
+        result.found_document_url,
+        result.tilstandsrapport_document_url,
+        result.status,
+        result.tilstandsrapport_status,
+    ))
+    conn.commit()
+
+    bolig_id = oppdater_bolig_broker_og_salgsoppgave(result.finn_ad_id, result.finn_url, result)
+
+    # Analyser salgsoppgaven med en gang en ekte PDF er lastet ned - dette
+    # dekker automatisk alle flytene (enkelt-knapp, batch, backfill, og nå
+    # den automatiske scanen) siden de alle går via denne funksjonen.
+    if bolig_id and result.local_pdf_path:
+        analyser_og_lagre_dokumentanalyse(bolig_id, result.local_pdf_path)
+
+    return bolig_id
+
+
 # ---------------- AUTOMATISK BOLIGSCAN (Gmail -> FINN -> lagring -> Slack) ----------------
 
 def kjor_gmail_boligscan(alert_settings, rente, nedbetaling_ar, ek_prosent, bruk_makslaan, maks_laan, max_results=100):
@@ -984,6 +1542,23 @@ def kjor_gmail_boligscan(alert_settings, rente, nedbetaling_ar, ek_prosent, bruk
                 """, (bolig_id,)).fetchone()
 
                 data["lat"], data["lon"], data["nearest_school"], data["nearest_school_km"], data["nearest_school_min"] = row
+
+                # Hent og analyser salgsoppgaven for enhver ny bolig FØR
+                # Slack-varselet sendes, slik at maybe_send_slack_alert (via
+                # bygg_dokument_seksjon_for_slack) kan legge ved en lenke til
+                # salgsoppgaven og et lite utkast av de viktigste funnene. En
+                # feil her skal aldri stoppe selve scanen eller Slack-varselet
+                # - boligen er allerede lagret, den blir da bare uten
+                # dokumentinfo i varselet.
+                try:
+                    salgsoppgave_resultat, _debug_info = hent_salgsoppgave_med_broker_fallback(
+                        data["url"], data["adresse"], data["postnummer"], data["by"]
+                    )
+                    lagre_salgsoppgave_forsok(salgsoppgave_resultat)
+                except Exception:
+                    logger.exception(
+                        "Klarte ikke å hente salgsoppgave for %s under scan - fortsetter uten.", data["url"]
+                    )
 
                 ok, msg = maybe_send_slack_alert(
                     bolig_id, data, alert_settings, rente, nedbetaling_ar, ek_prosent, bruk_makslaan, maks_laan
