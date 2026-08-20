@@ -89,4 +89,4 @@ This starts two services from the same image: the interactive Streamlit UI (`bol
 
 ## Author
 
-Built by Olav Leek as a personal project to automate his own apartment search.
+Built by Olav Leek as a personal project to automate apartment search.
